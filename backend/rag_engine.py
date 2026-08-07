@@ -59,7 +59,7 @@ os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = str(
 embeddings_model = OllamaEmbeddings(model="nomic-embed-text")
 
 llm = ChatGoogleGenerativeAI(
-    model="gemini-3.6-flash",
+    model="gemini-3.5-flash",
     project=GCP_PROJECT_ID,
     location=GCP_LOCATION,
     temperature=0.0
@@ -262,7 +262,7 @@ def ingest_documents() -> Dict[str, int]:
     global retriever
     retriever = vector_store.as_retriever(
         search_type="similarity_score_threshold",
-        search_kwargs={"k": 10, "score_threshold": 0.5},
+        search_kwargs={"k": 10, "score_threshold": 0.8},
     )
     answer_chain = create_stuff_documents_chain(llm, prompt_template)
     rag_chain = create_retrieval_chain(retriever, answer_chain)
