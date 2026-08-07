@@ -26,27 +26,6 @@ except Exception:
 
 st.sidebar.markdown("---")
 
-# 1. Ingestion Control
-st.sidebar.subheader("📄 Document Ingestion")
-if st.sidebar.button("🚀 Trigger Ingestion", use_container_width=True):
-    with st.sidebar.status("Ingesting documents...", expanded=True) as status:
-        try:
-            res = requests.post(f"{API_BASE_URL}/ingest", timeout=600)
-            if res.status_code == 200:
-                data = res.json()
-                status.update(
-                    label="✅ Ingestion Complete!", state="complete", expanded=False
-                )
-                st.sidebar.success(data.get("message", "Success!"))
-                if "chunks_indexed" in data:
-                    st.sidebar.info(f"Indexed {data['chunks_indexed']} chunks.")
-            else:
-                status.update(label="❌ Ingestion Failed", state="error")
-                st.sidebar.error(f"Error ({res.status_code}): {res.text}")
-        except Exception as e:
-            status.update(label="❌ Error Connecting", state="error")
-            st.sidebar.error(f"Request failed: {e}")
-
 # 2. Chunk Preview Inspector
 st.sidebar.markdown("---")
 st.sidebar.subheader("🔍 Chunk Inspector")
