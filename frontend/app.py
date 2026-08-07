@@ -1,12 +1,18 @@
-import streamlit as st
+import io
 import requests
+import streamlit as st
+from PIL import Image
 
 # Page setup
-st.set_page_config(page_title="Document Intelligence RAG", page_icon="🏗️", layout="wide")
+st.set_page_config(
+    page_title="Document Intelligence RAG", page_icon="🏗️", layout="wide"
+)
 
 # Sidebar Configuration
 st.sidebar.header("⚙️ Settings")
-API_BASE_URL = st.sidebar.text_input("FastAPI Base URL", value="http://localhost:8000")
+API_BASE_URL = st.sidebar.text_input(
+    "FastAPI Base URL", value="http://localhost:8000"
+)
 
 # Health Check Indicator
 try:
@@ -28,7 +34,9 @@ if st.sidebar.button("🚀 Trigger Ingestion", use_container_width=True):
             res = requests.post(f"{API_BASE_URL}/ingest", timeout=600)
             if res.status_code == 200:
                 data = res.json()
-                status.update(label="✅ Ingestion Complete!", state="complete", expanded=False)
+                status.update(
+                    label="✅ Ingestion Complete!", state="complete", expanded=False
+                )
                 st.sidebar.success(data.get("message", "Success!"))
                 if "chunks_indexed" in data:
                     st.sidebar.info(f"Indexed {data['chunks_indexed']} chunks.")
@@ -43,14 +51,16 @@ if st.sidebar.button("🚀 Trigger Ingestion", use_container_width=True):
 st.sidebar.markdown("---")
 st.sidebar.subheader("🔍 Chunk Inspector")
 limit = st.sidebar.slider("Chunk Limit", min_value=1, max_value=20, value=5)
-chars = st.sidebar.slider("Chars Per Chunk", min_value=100, max_value=1000, value=400)
+chars = st.sidebar.slider(
+    "Chars Per Chunk", min_value=100, max_value=1000, value=400
+)
 
 if st.sidebar.button("Preview Chunks", use_container_width=True):
     try:
         res = requests.post(
             f"{API_BASE_URL}/preview-chunks",
             json={"limit": limit, "chars": chars},
-            timeout=10
+            timeout=10,
         )
         if res.status_code == 200:
             chunks = res.json().get("chunks", [])
@@ -66,42 +76,88 @@ if "preview_chunks" in st.session_state:
             st.markdown(f"**Chunk {idx}:**")
             st.code(chunk, language="text")
 
+
+# --- MODAL DIALOG FOR CITATION HIGHLIGHT PREVIEW ---
+@st.dialog("📄 Citation Highlight Viewer", width="large")
+def view_citation_modal(source_item: dict):
+    doc_name = source_item.get("source", "Unknown PDF")
+    page_no = source_item.get("page_number", 1)
+    citation_id = source_item.get("citation_id", 1)
+
+    st.subheader(f"Source {citation_id}: {doc_name}")
+    st.caption(f"Page Number: {page_no}")
+
+    with st.spinner("Rendering document bounding box..."):
+        try:
+            response = requests.post(
+                f"{API_BASE_URL}/render-highlight",
+                json={
+                    "source": doc_name,
+                    "page_number": page_no,
+                    "dl_prov": source_item.get("dl_prov", []),
+                },
+                timeout=15,
+            )
+            if response.status_code == 200:
+                image_bytes = response.content
+                image = Image.open(io.BytesIO(image_bytes))
+                st.image(image, use_container_width=True)
+            else:
+                st.error(
+                    f"Failed to render image ({response.status_code}): {response.text}"
+                )
+        except Exception as err:
+            st.error(f"Could not connect to render endpoint: {err}")
+
+
 # --- MAIN UI: Chat Interface ---
 st.title("🏗️ Document Intelligence Assistant")
-st.caption("Ask questions about your uploaded construction plans, specs, and documents.")
+st.caption(
+    "Ask questions about your uploaded construction plans, specs, and"
+    " documents."
+)
 
-# Initialize chat history
 if "messages" not in st.session_state:
     st.session_state.messages = []
 
+
+def render_citations(sources: list, msg_idx: int):
+    """Renders interactive citation buttons that open pop-up modals."""
+    st.markdown("---")
+    st.markdown("**Cited Sources:**")
+    cols = st.columns(min(len(sources), 5))
+
+    for idx, src in enumerate(sources):
+        col_idx = idx % 5
+        citation_id = src.get("citation_id", idx + 1)
+        btn_label = f"📌 [Source {citation_id}]"
+
+        if cols[col_idx].button(
+            btn_label, key=f"cite_btn_{msg_idx}_{citation_id}"
+        ):
+            view_citation_modal(src)
+
+
 # Render chat history
-for message in st.session_state.messages:
+for msg_idx, message in enumerate(st.session_state.messages):
     with st.chat_message(message["role"]):
         st.markdown(message["content"])
         if message.get("sources"):
-            with st.expander("📚 View Citations"):
-                for idx, src in enumerate(message["sources"], 1):
-                    source_file = src.get("source", "Unknown")
-                    page = src.get("page_number", src.get("page_numbers", "N/A"))
-                    st.write(f"**{idx}. {source_file}** — *Page {page}*")
+            render_citations(message["sources"], msg_idx)
 
 # Handle user input
 if prompt := st.chat_input("Ask a question about your project docs..."):
-    # Append & display user prompt
     st.session_state.messages.append({"role": "user", "content": prompt})
     with st.chat_message("user"):
         st.markdown(prompt)
 
-    # Call FastAPI `/ask` endpoint
     with st.chat_message("assistant"):
         message_placeholder = st.empty()
         message_placeholder.markdown("🔍 Searching vector store...")
 
         try:
             res = requests.post(
-                f"{API_BASE_URL}/ask",
-                json={"question": prompt},
-                timeout=60
+                f"{API_BASE_URL}/ask", json={"question": prompt}, timeout=60
             )
 
             if res.status_code == 200:
@@ -111,20 +167,19 @@ if prompt := st.chat_input("Ask a question about your project docs..."):
 
                 message_placeholder.markdown(answer)
 
+                assistant_msg_idx = len(st.session_state.messages)
                 if sources:
-                    with st.expander("📚 View Citations"):
-                        for idx, src in enumerate(sources, 1):
-                            source_file = src.get("source", "Unknown")
-                            page = src.get("page_number", src.get("page_numbers", "N/A"))
-                            st.write(f"**{idx}. {source_file}** — *Page {page}*")
+                    render_citations(sources, assistant_msg_idx)
 
-                st.session_state.messages.append({
-                    "role": "assistant",
-                    "content": answer,
-                    "sources": sources
-                })
+                st.session_state.messages.append(
+                    {"role": "assistant", "content": answer, "sources": sources}
+                )
             else:
-                message_placeholder.error(f"API Error ({res.status_code}): {res.text}")
+                message_placeholder.error(
+                    f"API Error ({res.status_code}): {res.text}"
+                )
 
         except Exception as e:
-            message_placeholder.error(f"Failed to connect to backend at {API_BASE_URL}: {e}")
+            message_placeholder.error(
+                f"Failed to connect to backend at {API_BASE_URL}: {e}"
+            )
