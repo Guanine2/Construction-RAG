@@ -15,10 +15,11 @@ from docling.datamodel.pipeline_options import (
 from docling.document_converter import DocumentConverter, PdfFormatOption
 
 # LangChain Integrations & Core
+
 from langchain_chroma import Chroma
 from langchain_community.document_loaders import TextLoader
 from langchain_core.documents import Document
-from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.prompts import ChatPromptTemplate, PromptTemplate
 from langchain_docling import DoclingLoader
 from langchain_docling.loader import BaseMetaExtractor, ExportType
 from langchain_google_genai import ChatGoogleGenerativeAI
@@ -71,8 +72,8 @@ system_prompt = """
 You are an expert internal document intelligence assistant for engineering and legal files.
 
 CRITICAL INSTRUCTIONS:
-1. Grounding: Answer ONLY using the provided Context. If the context does not contain sufficient facts to answer, explicitly state: "I cannot find this information in the provided documents."
-2. Citation: For EVERY factual claim or number you cite, explicitly reference the source document name and section/page (e.g., [Source: Construction_Abridged.pdf, Page 1]).
+1. Grounding: Answer ONLY using the provided Context. If the context does not contain sufficient facts, explicitly state: "I cannot find this information in the provided documents."
+2. Citation: For EVERY factual claim or number, explicitly cite the source number using brackets (e.g., [Source 1] or [Source 2]). Do NOT cite document filenames or page numbers.
 3. Reasoning: Step-by-step, verify that your claims match the context before producing your final answer.
 
 Context:
@@ -84,6 +85,10 @@ prompt_template = ChatPromptTemplate.from_messages(
         ("system", system_prompt),
         ("human", "{input}"),
     ]
+)
+
+document_prompt = PromptTemplate.from_template(
+    "[Source {source_index}]\nDocument Content:\n{page_content}\n"
 )
 
 # Global runtime state for DB and Chain
@@ -290,59 +295,72 @@ def preview_chroma_chunks(limit: int = 5, chars: int = 400) -> List[Dict[str, An
     return previews
 
 
-def _extract_source_info(doc: Document) -> Dict[str, str]:
-    """Helper to extract clean source metadata from a document."""
+def _extract_source_info(doc: Document, index: int) -> Dict[str, Any]:
+    """Extracts clean source metadata including bounding boxes and citation index."""
     meta = getattr(doc, "metadata", {}) or {}
-    page_ref = meta.get("page_numbers") or meta.get("page_number") or "N/A"
     
+    # Load bounding boxes JSON string if available
+    dl_prov = []
+    if "dl_prov" in meta:
+        try:
+            dl_prov = json.loads(meta["dl_prov"])
+        except Exception:
+            dl_prov = []
+
     return {
+        "citation_id": index,  # 1-based index matching [Source 1]
         "source": meta.get("source", "Unknown"),
         "file_type": meta.get("file_type", "Unknown"),
-        "page_numbers": str(page_ref)
+        "page_number": meta.get("page_number", 1),
+        "page_numbers": str(meta.get("page_numbers", "N/A")),
+        "dl_prov": dl_prov,    # Bounding boxes for drawing the highlight box
     }
 
 def ask_question(question: str) -> Dict[str, Any]:
-    global rag_chain
-    if rag_chain is None:
+    global vector_store, retriever
+    if vector_store is None:
         build_or_reload_chain()
 
-    # 1) Fetch relevant documents directly from vector store / retriever
+    # 1. Fetch top candidate documents
     docs: List[Document] = []
     try:
         if retriever is not None and hasattr(retriever, "invoke"):
             docs = retriever.invoke(question)[:FINAL_K]
-        elif retriever is not None and hasattr(retriever, "get_relevant_documents"):
-            docs = retriever.get_relevant_documents(question, k=FINAL_K)
         elif vector_store is not None and hasattr(vector_store, "similarity_search"):
             docs = vector_store.similarity_search(question, k=FINAL_K)
     except Exception:
         docs = []
 
-    # Fallback if no documents found
     if not docs:
-        response = rag_chain.invoke({"input": question})
-        sources = [_extract_source_info(doc) for doc in response.get("context", [])]
         return {
-            "answer": response.get("answer", ""),
-            "sources": sources,
+            "answer": "I cannot find this information in the provided documents.",
+            "sources": [],
         }
 
-    # 2) Build answer using retrieved documents directly
-    answer_chain = create_stuff_documents_chain(llm, prompt_template)
-    try:
-        response = answer_chain.invoke({"input_documents": docs, "input": question})
-        if isinstance(response, dict):
-            answer_text = response.get("answer") or response.get("output_text") or response.get("text") or str(response)
-        else:
-            answer_text = str(response)
-    except Exception:
-        response = rag_chain.invoke({"input": question})
-        answer_text = response.get("answer", "")
+    # 2. Assign 1-based citation index to document metadata
+    for i, doc in enumerate(docs, start=1):
+        doc.metadata["source_index"] = i
 
-    # 3) Format sources cleanly using helper
-    sources = [_extract_source_info(doc) for doc in docs]
+    # 3. Create chain and pass "context": docs
+    answer_chain = create_stuff_documents_chain(
+        llm=llm, prompt=prompt_template, document_prompt=document_prompt
+    )
+
+    # FIXED: Changed "input_documents" to "context"
+    response = answer_chain.invoke({"context": docs, "input": question})
+
+    if isinstance(response, dict):
+        answer_text = (
+            response.get("answer")
+            or response.get("output_text")
+            or str(response)
+        )
+    else:
+        answer_text = str(response)
+
+    # 4. Extract sources array matching [Source 1], [Source 2] order
+    sources = [
+        _extract_source_info(doc, i) for i, doc in enumerate(docs, start=1)
+    ]
 
     return {"answer": answer_text, "sources": sources}
-
-
-# Initialize model once (e.g., during app startup)
