@@ -8,7 +8,6 @@ from typing import Any, Dict, List, Optional
 from docling.chunking import HybridChunker
 from docling.datamodel.base_models import InputFormat
 from docling.datamodel.pipeline_options import (
-    OcrEngine,
     PdfPipelineOptions,
     RapidOcrOptions,
 )
@@ -30,8 +29,6 @@ from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_classic.chains import create_retrieval_chain
 from langchain_classic.chains.combine_documents import create_stuff_documents_chain
 
-from sentence_transformers import CrossEncoder
-from transformers import AutoModelForSequenceClassification
 
 # Lazy-loaded CrossEncoder instance to prevent process spawn crashes during reload
 _reranker_model = None
