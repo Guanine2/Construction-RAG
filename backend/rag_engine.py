@@ -251,18 +251,32 @@ def ingest_documents() -> Dict[str, int]:
             # Only split plain text/markdown files
             final_chunks.extend(text_splitter.split_documents([doc]))
 
+    valid_chunks = [
+        doc for doc in final_chunks
+        if doc.page_content and doc.page_content.strip()
+    ]
+    
+    if not valid_chunks:
+        return {"chunks_indexed": 0, "documents_loaded": len(raw_docs)}
+    
     CHROMA_DIR.mkdir(parents=True, exist_ok=True)
+    batch_size = 50 
+    
     vector_store = Chroma.from_documents(
-        documents=final_chunks,
+        documents=valid_chunks[:batch_size],
         embedding=embeddings_model,
         collection_name=COLLECTION_NAME,
         persist_directory=str(CHROMA_DIR),
     )
-
+    
+    for i in range(batch_size, len(valid_chunks), batch_size):
+        batch = valid_chunks[i : i + batch_size]
+        vector_store.add_documents(batch)
+    
     global retriever
     retriever = vector_store.as_retriever(
         search_type="similarity_score_threshold",
-        search_kwargs={"k": 10, "score_threshold": 0.8},
+        search_kwargs={"k": 10, "score_threshold": 0.5},
     )
     answer_chain = create_stuff_documents_chain(llm, prompt_template)
     rag_chain = create_retrieval_chain(retriever, answer_chain)
