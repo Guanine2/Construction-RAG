@@ -192,7 +192,7 @@ def load_documents_from_folder() -> List[Document]:
         # Define HybridChunker with target token size
         hybrid_chunker = HybridChunker(
             max_tokens=450,      # Target embedding window size
-            merge_peers=True     # Combines small elements under the same header
+            merge_peers=False     # Combines small elements under the same header
         )
 
         pdf_loader = DoclingLoader(
