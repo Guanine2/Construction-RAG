@@ -3,6 +3,7 @@ import os
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+from dotenv import load_dotenv
 
 # Docling Imports
 from docling.chunking import HybridChunker, HierarchicalChunker
@@ -30,8 +31,7 @@ from langchain_classic.chains import create_retrieval_chain
 from langchain_classic.chains.combine_documents import create_stuff_documents_chain
 
 
-# Lazy-loaded CrossEncoder instance to prevent process spawn crashes during reload
-_reranker_model = None
+load_dotenv()
 
 # ==========================================
 # CONFIGURATION & PATHS
@@ -42,16 +42,14 @@ PROJECT_ROOT = BACKEND_DIR.parent
 
 DOCS_DIR = PROJECT_ROOT / "docs"
 CHROMA_DIR = PROJECT_ROOT / "chroma_db" / "langchain_document_intelligence"
-KEYS_DIR = PROJECT_ROOT / "keys"
 
-COLLECTION_NAME = "internal_documents"
+COLLECTION_NAME = os.getenv("COLLECTION_NAME", "internal_documents")
 
-GCP_PROJECT_ID = "text-email-digest-test"
-GCP_LOCATION = "global"
-
-os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = str(
-    KEYS_DIR / "text-email-digest-test-d8e0e0d73e80.json"
-)
+GCP_PROJECT_ID = os.getenv("GCP_PROJECT_ID")
+GCP_LOCATION = os.getenv("GCP_LOCATION", "global")
+key_path = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
+if key_path:
+    os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = str(PROJECT_ROOT / key_path)
 
 # ==========================================
 # MODELS & PROMPTS SETUP
