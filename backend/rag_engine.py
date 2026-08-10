@@ -5,7 +5,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 # Docling Imports
-from docling.chunking import HybridChunker
+from docling.chunking import HybridChunker, HierarchicalChunker
 from docling.datamodel.base_models import InputFormat
 from docling.datamodel.pipeline_options import (
     PdfPipelineOptions,
@@ -85,7 +85,8 @@ prompt_template = ChatPromptTemplate.from_messages(
 )
 
 document_prompt = PromptTemplate.from_template(
-    "[Source {source_index}]\nDocument Content:\n{page_content}\n"
+    "[Source {source_index} | File: {source} | Page: {page_number}]\n"
+    "Document Content:\n{page_content}\n"
 )
 
 # Global runtime state for DB and Chain
@@ -189,16 +190,16 @@ def load_documents_from_folder() -> List[Document]:
             }
         )
         
-        # Define HybridChunker with target token size
-        hybrid_chunker = HybridChunker(
-            max_tokens=450,      # Target embedding window size
-            merge_peers=False     # Combines small elements under the same header
+        # Define HierarchicalChunker with target token size
+        hierarchical_chunker = HierarchicalChunker(
+            merge_list_items=True,
+            always_emit_headings=False
         )
 
         pdf_loader = DoclingLoader(
             file_path=pdf_paths,
             export_type=ExportType.DOC_CHUNKS,
-            chunker=hybrid_chunker,              # <--- PASS CHUNKER HERE
+            chunker=hierarchical_chunker,              # <--- PASS CHUNKER HERE
             converter=custom_converter,
             meta_extractor=PageAwareMetaExtractor(),
         )
@@ -251,18 +252,32 @@ def ingest_documents() -> Dict[str, int]:
             # Only split plain text/markdown files
             final_chunks.extend(text_splitter.split_documents([doc]))
 
+    valid_chunks = [
+        doc for doc in final_chunks
+        if doc.page_content and doc.page_content.strip()
+    ]
+    
+    if not valid_chunks:
+        return {"chunks_indexed": 0, "documents_loaded": len(raw_docs)}
+    
     CHROMA_DIR.mkdir(parents=True, exist_ok=True)
+    batch_size = 50 
+    
     vector_store = Chroma.from_documents(
-        documents=final_chunks,
+        documents=valid_chunks[:batch_size],
         embedding=embeddings_model,
         collection_name=COLLECTION_NAME,
         persist_directory=str(CHROMA_DIR),
     )
-
+    
+    for i in range(batch_size, len(valid_chunks), batch_size):
+        batch = valid_chunks[i : i + batch_size]
+        vector_store.add_documents(batch)
+    
     global retriever
     retriever = vector_store.as_retriever(
         search_type="similarity_score_threshold",
-        search_kwargs={"k": 10, "score_threshold": 0.8},
+        search_kwargs={"k": 10, "score_threshold": 0.5},
     )
     answer_chain = create_stuff_documents_chain(llm, prompt_template)
     rag_chain = create_retrieval_chain(retriever, answer_chain)
