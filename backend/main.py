@@ -43,7 +43,7 @@ def render_highlight_endpoint(req: HighlightRequest):
         page_idx = max(0, req.page_number - 1)
         page = doc.load_page(page_idx)
 
-        zoom = 2.0
+        zoom = 4.17
         mat = fitz.Matrix(zoom, zoom)
         pix = page.get_pixmap(matrix=mat)
 

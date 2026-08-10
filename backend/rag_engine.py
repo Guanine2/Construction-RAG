@@ -5,7 +5,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 # Docling Imports
-from docling.chunking import HybridChunker
+from docling.chunking import HybridChunker, HierarchicalChunker
 from docling.datamodel.base_models import InputFormat
 from docling.datamodel.pipeline_options import (
     PdfPipelineOptions,
@@ -85,7 +85,8 @@ prompt_template = ChatPromptTemplate.from_messages(
 )
 
 document_prompt = PromptTemplate.from_template(
-    "[Source {source_index}]\nDocument Content:\n{page_content}\n"
+    "[Source {source_index} | File: {source} | Page: {page_number}]\n"
+    "Document Content:\n{page_content}\n"
 )
 
 # Global runtime state for DB and Chain
@@ -189,16 +190,16 @@ def load_documents_from_folder() -> List[Document]:
             }
         )
         
-        # Define HybridChunker with target token size
-        hybrid_chunker = HybridChunker(
-            max_tokens=450,      # Target embedding window size
-            merge_peers=False     # Combines small elements under the same header
+        # Define HierarchicalChunker with target token size
+        hierarchical_chunker = HierarchicalChunker(
+            merge_list_items=True,
+            always_emit_headings=False
         )
 
         pdf_loader = DoclingLoader(
             file_path=pdf_paths,
             export_type=ExportType.DOC_CHUNKS,
-            chunker=hybrid_chunker,              # <--- PASS CHUNKER HERE
+            chunker=hierarchical_chunker,              # <--- PASS CHUNKER HERE
             converter=custom_converter,
             meta_extractor=PageAwareMetaExtractor(),
         )
