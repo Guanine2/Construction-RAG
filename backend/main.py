@@ -1,3 +1,5 @@
+from typing import Dict, Tuple
+
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 import uvicorn
@@ -18,6 +20,7 @@ from backend.rag_engine import (
 
 app = FastAPI(title="Document Intelligence RAG")
 
+PAGE_CACHE: Dict[Tuple[str, int], Tuple[Image.Image, float]] = {}
 
 class QueryRequest(BaseModel):
     question: str
@@ -32,25 +35,41 @@ class HighlightRequest(BaseModel):
     page_number: int
     dl_prov: list
 
+
+
 @app.post("/render-highlight")
 def render_highlight_endpoint(req: HighlightRequest):
-    pdf_path = DOCS_DIR / req.source
-    if not pdf_path.exists():
-        raise HTTPException(status_code=404, detail="PDF file not found")
+    cache_key = (req.source, req.page_number)
+    zoom = 6
 
     try:
-        doc = fitz.open(pdf_path)
-        page_idx = max(0, req.page_number - 1)
-        page = doc.load_page(page_idx)
+        # 1. CHECK CACHE FOR CLEAN IMAGE & PAGE HEIGHT
+        if cache_key in PAGE_CACHE:
+            base_img, page_h = PAGE_CACHE[cache_key]
+        else:
+            pdf_path = DOCS_DIR / req.source
+            if not pdf_path.exists():
+                raise HTTPException(status_code=404, detail="PDF file not found")
 
-        zoom = 4.17
-        mat = fitz.Matrix(zoom, zoom)
-        pix = page.get_pixmap(matrix=mat)
+            doc = fitz.open(pdf_path)
+            page_idx = max(0, req.page_number - 1)
+            page = doc.load_page(page_idx)
 
-        img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+            mat = fitz.Matrix(zoom, zoom)
+            pix = page.get_pixmap(matrix=mat)
+
+            base_img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+            page_h = page.rect.height
+
+            # Cache clean un-marked image and page height
+            PAGE_CACHE[cache_key] = (base_img, page_h)
+
+        # 2. ALWAYS COPY THE BASE IMAGE
+        # This guarantees the cached image stays pristine and old boxes are never reused
+        img = base_img.copy()
         draw = ImageDraw.Draw(img, "RGBA")
-        page_h = page.rect.height
 
+        # 3. DRAW CURRENT REQUEST'S BOXES ONLY
         for prov in req.dl_prov:
             bbox = prov.get("bbox")
             if not bbox:
@@ -76,6 +95,7 @@ def render_highlight_endpoint(req: HighlightRequest):
                 width=3,
             )
 
+        # 4. RETURN PNG BYTES
         img_byte_arr = io.BytesIO()
         img.save(img_byte_arr, format="PNG")
         return Response(content=img_byte_arr.getvalue(), media_type="image/png")
