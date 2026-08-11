@@ -1,13 +1,12 @@
-from typing import Dict, Tuple
-
+from typing import Dict, Tuple, List, Optional
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 import uvicorn
 import io
 from fastapi.responses import Response
-from pydantic import BaseModel
 import fitz 
 from PIL import Image, ImageDraw
+
 
 # Import engine logic
 from backend.rag_engine import (
@@ -35,7 +34,9 @@ class HighlightRequest(BaseModel):
     page_number: int
     dl_prov: list
 
-
+class IngestRequest(BaseModel):
+    files: Optional[List[str]] = None
+    
 
 @app.post("/render-highlight")
 def render_highlight_endpoint(req: HighlightRequest):
@@ -103,6 +104,7 @@ def render_highlight_endpoint(req: HighlightRequest):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
     
+    
 @app.on_event("startup")
 def startup_event() -> None:
     build_or_reload_chain()
@@ -114,16 +116,16 @@ def health() -> dict:
 
 
 @app.post("/ingest")
-def ingest_endpoint() -> dict:
+def ingest_endpoint(request: Optional[IngestRequest] = None) -> dict:
     try:
-        result = ingest_documents()
+        target_files = request.files if request else None
+        result = ingest_documents(target_files=target_files)
         return {
             "message": "Documents ingested successfully.",
             **result,
         }
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc))
-
 
 @app.post("/preview-chunks")
 def preview_chunks_endpoint(request: PreviewRequest) -> dict:

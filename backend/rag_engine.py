@@ -3,7 +3,7 @@ import os
 import time
 import json
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 from dotenv import load_dotenv
 
 # Docling Imports
@@ -181,19 +181,35 @@ def _load_text_documents(file_path: Path) -> List[Document]:
     return docs
 
 
-def load_documents_from_folder() -> List[Document]:
+def load_documents_from_folder(target_files: List[str] = None) -> List[Document]:
     if not DOCS_DIR.exists():
         raise FileNotFoundError(f"Document folder not found: {DOCS_DIR}")
 
     documents: List[Document] = []
     pdf_paths: List[str] = []
 
-    for file_path in sorted(DOCS_DIR.iterdir()):
+    # 1. Determine which paths to look for
+    if target_files:
+        # Resolve names against DOCS_DIR or use direct path strings
+        candidate_paths = [
+            DOCS_DIR / f if not Path(f).is_absolute() else Path(f) 
+            for f in target_files
+        ]
+    else:
+        candidate_paths = sorted(DOCS_DIR.iterdir())
+
+    # 2. Iterate through candidate files
+    for file_path in candidate_paths:
+        if not file_path.exists():
+            logger.warning(f"File not found, skipping: {file_path}")
+            continue
+
         if file_path.suffix.lower() in {".txt", ".md"}:
             documents.extend(_load_text_documents(file_path))
         elif file_path.suffix.lower() == ".pdf":
             pdf_paths.append(str(file_path))
 
+    # Process PDFs with Docling as usual
     if pdf_paths:
         pipeline_options = PdfPipelineOptions()
         pipeline_options.do_ocr = True
@@ -206,7 +222,6 @@ def load_documents_from_folder() -> List[Document]:
             }
         )
         
-        # Define HierarchicalChunker with target token size
         hierarchical_chunker = HierarchicalChunker(
             merge_list_items=True,
             always_emit_headings=False
@@ -215,14 +230,14 @@ def load_documents_from_folder() -> List[Document]:
         pdf_loader = DoclingLoader(
             file_path=pdf_paths,
             export_type=ExportType.DOC_CHUNKS,
-            chunker=hierarchical_chunker,              # <--- PASS CHUNKER HERE
+            chunker=hierarchical_chunker,
             converter=custom_converter,
             meta_extractor=PageAwareMetaExtractor(),
         )
         documents.extend(pdf_loader.load())
 
     if not documents:
-        raise ValueError("No supported documents found in the docs folder.")
+        raise ValueError("No supported or existing documents were provided for ingestion.")
 
     return documents
 
@@ -246,11 +261,11 @@ def build_or_reload_chain() -> None:
     answer_chain = create_stuff_documents_chain(llm, prompt_template)
     rag_chain = create_retrieval_chain(retriever, answer_chain)
 
-def ingest_documents() -> Dict[str, int]:
+def ingest_documents(target_files: Optional[List[str]] = None) -> Dict[str, int]:
     """Ingests documents into ChromaDB and re-attaches the compressed retriever."""
     global vector_store, retriever, rag_chain
 
-    raw_docs = load_documents_from_folder()
+    raw_docs = load_documents_from_folder(target_files=target_files)
     
     final_chunks: List[Document] = []
     text_splitter = RecursiveCharacterTextSplitter(
@@ -287,7 +302,6 @@ def ingest_documents() -> Dict[str, int]:
         batch = valid_chunks[i : i + batch_size]
         vector_store.add_documents(batch)
     
-    # FIXED: Re-attach the reranker here as well
     retriever = _get_compressed_retriever(vector_store)
     answer_chain = create_stuff_documents_chain(llm, prompt_template)
     rag_chain = create_retrieval_chain(retriever, answer_chain)
