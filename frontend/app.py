@@ -80,14 +80,16 @@ def view_citation_modal(source_item: dict):
             if response.status_code == 200:
                 image_bytes = response.content
                 image = Image.open(io.BytesIO(image_bytes))
-                st.image(image, use_container_width=True)
+
+                # 1. Force PNG output to avoid lossy JPEG compression
+                # 2. Drop `use_container_width=True` or match native aspect ratio
+                st.image(image, output_format="PNG")
             else:
                 st.error(
                     f"Failed to render image ({response.status_code}): {response.text}"
                 )
         except Exception as err:
             st.error(f"Could not connect to render endpoint: {err}")
-
 
 # --- MAIN UI: Chat Interface ---
 st.title("🏗️ Document Intelligence Assistant")
