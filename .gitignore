@@ -31,3 +31,5 @@ torch/
 docs_ignore
 saved
 
+example.html
+requirements.txt

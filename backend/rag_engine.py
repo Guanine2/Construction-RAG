@@ -1,19 +1,25 @@
 import logging
 import os
 import time
+import json
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 from dotenv import load_dotenv
+import fitz
+import torch
 
 # Docling Imports
-from docling.chunking import HybridChunker, HierarchicalChunker
+from docling.chunking import HybridChunker
 from docling.datamodel.base_models import InputFormat
 from docling.datamodel.pipeline_options import (
     PdfPipelineOptions,
     RapidOcrOptions,
+    AcceleratorOptions,
+    AcceleratorDevice
 )
 from docling.document_converter import DocumentConverter, PdfFormatOption
-
+from langchain_google_community import VertexAIRank
+from langchain_classic.retrievers import ContextualCompressionRetriever
 # LangChain Integrations & Core
 
 from langchain_chroma import Chroma
@@ -47,6 +53,13 @@ COLLECTION_NAME = os.getenv("COLLECTION_NAME", "internal_documents")
 
 GCP_PROJECT_ID = os.getenv("GCP_PROJECT_ID")
 GCP_LOCATION = os.getenv("GCP_LOCATION", "global")
+
+os.environ["DOCLING_DEVICE"] = "cpu"
+os.environ["TORCHDYNAMO_DISABLE"] = "1"
+
+FETCH_K = 50
+FINAL_K = 10
+
 key_path = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
 if key_path:
     os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = str(PROJECT_ROOT / key_path)
@@ -56,11 +69,20 @@ if key_path:
 # ==========================================
 embeddings_model = OllamaEmbeddings(model="nomic-embed-text")
 
+
 llm = ChatGoogleGenerativeAI(
     model="gemini-3.5-flash",
     project=GCP_PROJECT_ID,
     location=GCP_LOCATION,
     temperature=0.0
+)
+
+reranker = VertexAIRank(
+    project_id=GCP_PROJECT_ID,
+    location_id=GCP_LOCATION,
+    ranking_config="default_ranking_config",
+    model="semantic-ranker-fast@latest",  # or "semantic-ranker-default-004"
+    top_n=FINAL_K,                         # Number of final documents to keep
 )
 
 system_prompt = """
@@ -93,17 +115,17 @@ retriever = None
 rag_chain = None
 
 # Reranker configuration
-FETCH_N = 50
-FINAL_K = 10
 logger = logging.getLogger(__name__)
 
-# Custom Metadata Extractor for LangChain Docling
-import json
-from pathlib import Path
-from typing import Any, Dict
-from langchain_docling.loader import BaseMetaExtractor
 
-
+def _get_compressed_retriever(store: Chroma) -> ContextualCompressionRetriever:
+    """Wraps Chroma vector store with VertexAIRank compression."""
+    base_retriever = store.as_retriever(search_kwargs={"k": FETCH_K})
+    return ContextualCompressionRetriever(
+        base_compressor=reranker,
+        base_retriever=base_retriever
+    )
+    
 class PageAwareMetaExtractor(BaseMetaExtractor):
     def extract_chunk_meta(self, file_path: str, chunk: Any) -> Dict[str, Any]:
         dl_meta = chunk.meta.export_json_dict() if hasattr(chunk, "meta") else {}
@@ -158,53 +180,62 @@ def _load_text_documents(file_path: Path) -> List[Document]:
     for doc in docs:
         doc.metadata.update({
             "source": file_path.name,
-            "file_type": file_path.suffix.lstrip(".")
+            "file_type": file_path.suffix.lstrip("."),
+            "page_number": 1,           # <--- REQUIRED for prompt template
+            "page_numbers": "1",
         })
     return docs
 
 
-def load_documents_from_folder() -> List[Document]:
+def load_documents_from_folder(target_files: Optional[List[str]] = None) -> List[Document]:
     if not DOCS_DIR.exists():
         raise FileNotFoundError(f"Document folder not found: {DOCS_DIR}")
 
     documents: List[Document] = []
-    pdf_paths: List[str] = []
+    pdf_paths: List[Path] = []
 
-    for file_path in sorted(DOCS_DIR.iterdir()):
+    # 1. Determine candidate files
+    candidate_paths = (
+        [DOCS_DIR / f if not Path(f).is_absolute() else Path(f) for f in target_files]
+        if target_files else sorted(DOCS_DIR.iterdir())
+    )
+
+    # 2. Separate text files and PDF paths
+    for file_path in candidate_paths:
+        if not file_path.exists():
+            continue
         if file_path.suffix.lower() in {".txt", ".md"}:
             documents.extend(_load_text_documents(file_path))
         elif file_path.suffix.lower() == ".pdf":
-            pdf_paths.append(str(file_path))
+            pdf_paths.append(file_path)
 
+    # 3. Pass PDFs directly to Docling (No PyMuPDF rendering step)
     if pdf_paths:
-        pipeline_options = PdfPipelineOptions()
+        pipeline_options = PdfPipelineOptions(
+            accelerator_options=AcceleratorOptions(
+            device=AcceleratorDevice.CPU  # Bypasses MPS float64 crash entirely
+    )
+)
         pipeline_options.do_ocr = True
-        pipeline_options.images_scale = 3.0
-        pipeline_options.ocr_options = RapidOcrOptions()
+        pipeline_options.ocr_options = RapidOcrOptions(backend="paddle")
 
         custom_converter = DocumentConverter(
+            allowed_formats=[InputFormat.PDF],
             format_options={
                 InputFormat.PDF: PdfFormatOption(pipeline_options=pipeline_options)
             }
         )
-        
-        # Define HierarchicalChunker with target token size
-        hierarchical_chunker = HierarchicalChunker(
-            merge_list_items=True,
-            always_emit_headings=False
-        )
+
+        hybrid_chunker = HybridChunker(max_tokens=216, merge_peers=True)
 
         pdf_loader = DoclingLoader(
-            file_path=pdf_paths,
+            file_path=[str(p) for p in pdf_paths], # Absolute PDF paths
             export_type=ExportType.DOC_CHUNKS,
-            chunker=hierarchical_chunker,              # <--- PASS CHUNKER HERE
+            chunker=hybrid_chunker,
             converter=custom_converter,
             meta_extractor=PageAwareMetaExtractor(),
         )
         documents.extend(pdf_loader.load())
-
-    if not documents:
-        raise ValueError("No supported documents found in the docs folder.")
 
     return documents
 
@@ -213,8 +244,8 @@ def load_documents_from_folder() -> List[Document]:
 # CORE RAG FUNCTIONS
 # ==========================================
 def build_or_reload_chain() -> None:
-    """Initializes or reloads the Chroma vector store and the RAG retrieval chain."""
-    global vector_store, rag_chain
+    """Initializes or reloads the Chroma vector store and compression retriever."""
+    global vector_store, retriever, rag_chain
 
     CHROMA_DIR.mkdir(parents=True, exist_ok=True)
     vector_store = Chroma(
@@ -222,18 +253,17 @@ def build_or_reload_chain() -> None:
         persist_directory=str(CHROMA_DIR),
         embedding_function=embeddings_model,
     )
-    # expose a retriever globally so ask_question can fetch large candidate sets
-    global retriever
-    retriever = vector_store.as_retriever(search_kwargs={"k": 10})
+    
+    # Correctly attach compression retriever
+    retriever = _get_compressed_retriever(vector_store)
     answer_chain = create_stuff_documents_chain(llm, prompt_template)
     rag_chain = create_retrieval_chain(retriever, answer_chain)
 
+def ingest_documents(target_files: Optional[List[str]] = None) -> Dict[str, int]:
+    """Ingests documents into ChromaDB and re-attaches the compressed retriever."""
+    global vector_store, retriever, rag_chain
 
-def ingest_documents() -> Dict[str, int]:
-    """Ingests documents into ChromaDB using Docling HybridChunker for PDFs."""
-    global vector_store, rag_chain
-
-    raw_docs = load_documents_from_folder()
+    raw_docs = load_documents_from_folder(target_files=target_files)
     
     final_chunks: List[Document] = []
     text_splitter = RecursiveCharacterTextSplitter(
@@ -243,11 +273,9 @@ def ingest_documents() -> Dict[str, int]:
     )
 
     for doc in raw_docs:
-        # If it's a PDF, it is already chunked natively by HybridChunker
         if doc.metadata.get("file_type") == "pdf":
             final_chunks.append(doc)
         else:
-            # Only split plain text/markdown files
             final_chunks.extend(text_splitter.split_documents([doc]))
 
     valid_chunks = [
@@ -272,33 +300,43 @@ def ingest_documents() -> Dict[str, int]:
         batch = valid_chunks[i : i + batch_size]
         vector_store.add_documents(batch)
     
-    global retriever
-    retriever = vector_store.as_retriever(
-        search_type="similarity_score_threshold",
-        search_kwargs={"k": 10, "score_threshold": 0.5},
-    )
+    retriever = _get_compressed_retriever(vector_store)
     answer_chain = create_stuff_documents_chain(llm, prompt_template)
     rag_chain = create_retrieval_chain(retriever, answer_chain)
 
     return {"chunks_indexed": len(final_chunks), "documents_loaded": len(raw_docs)}
 
-def preview_chroma_chunks(limit: int = 5, chars: int = 400) -> List[Dict[str, Any]]:
+def preview_chroma_chunks(
+    limit: int = 5, 
+    chars: int = 400, 
+    filename: Optional[str] = None
+) -> List[Dict[str, Any]]:
     """Returns previews of chunks directly from the Chroma vector store."""
     if vector_store is None:
         return []
 
+    # Optional metadata filter for a specific filename
+    where_clause = {"source": filename} if filename else None
+
     # Fetch stored chunks and metadata directly from Chroma
-    data = vector_store.get(limit=limit, include=["documents", "metadatas"])
+    data = vector_store.get(
+        limit=limit, 
+        where=where_clause,
+        include=["documents", "metadatas"]
+    )
 
     previews: List[Dict[str, Any]] = []
     documents = data.get("documents") or []
     metadatas = data.get("metadatas") or []
 
     for text, meta in zip(documents, metadatas):
+        # Create a clean metadata copy excluding bounding box arrays (dl_prov)
+        clean_meta = {k: v for k, v in meta.items() if k != "dl_prov"}
+        
         previews.append(
             {
                 "text": text[:chars],
-                "metadata": meta,
+                "metadata": clean_meta,
             }
         )
 
@@ -327,50 +365,59 @@ def _extract_source_info(doc: Document, index: int) -> Dict[str, Any]:
     }
 
 def ask_question(question: str) -> Dict[str, Any]:
-    global vector_store, retriever
+    global vector_store
     if vector_store is None:
         build_or_reload_chain()
 
-    # 1. Fetch top candidate documents
-    docs: List[Document] = []
-    try:
-        if retriever is not None and hasattr(retriever, "invoke"):
-            docs = retriever.invoke(question)[:FINAL_K]
-        elif vector_store is not None and hasattr(vector_store, "similarity_search"):
-            docs = vector_store.similarity_search(question, k=FINAL_K)
-    except Exception:
-        docs = []
+    # 1. Fetch raw candidate documents (contains full metadata)
+    raw_candidates = vector_store.similarity_search(question, k=FETCH_K)
 
-    if not docs:
-        return {
-            "answer": "I cannot find this information in the provided documents.",
-            "sources": [],
-        }
+    # 2. Rerank candidates using VertexAIRank
+    reranked_docs = reranker.compress_documents(documents=raw_candidates, query=question)
 
-    # 2. Assign 1-based citation index to document metadata
-    for i, doc in enumerate(docs, start=1):
+    # 3. Restore lost metadata from raw_candidates by matching page_content
+    content_to_meta = {doc.page_content: doc.metadata for doc in raw_candidates}
+    
+    
+    print(f"\n=================== RERANKED RESULTS' ===================")
+    for rank, doc in enumerate(reranked_docs, start=1):
+        meta = doc.metadata
+        score = meta.get("relevance_score", "N/A")
+        # Format score as float if present
+        score_str = f"{score:.4f}" if isinstance(score, float) else str(score)
+        
+        source = meta.get("source", "Unknown")
+        page = meta.get("page_number", 1)
+        snippet = doc.page_content.strip().replace("\n", " ")[:120]
+
+        print(f"Rank [{rank:02d}] | Score: {score_str} | File: {source} | Page: {page}")
+        print(f"         Snippet: \"{snippet}...\"\n")
+    print("===========================================================================\n")
+    
+    
+    for i, doc in enumerate(reranked_docs, start=1):
+        # Merge original metadata back onto reranked document
+        original_meta = content_to_meta.get(doc.page_content, {})
+        doc.metadata.update(original_meta)
+        
+        # Ensure mandatory prompt template variables exist
         doc.metadata["source_index"] = i
+        doc.metadata.setdefault("source", "Unknown")
+        doc.metadata.setdefault("page_number", 1)
 
-    # 3. Create chain and pass "context": docs
+    # 4. Invoke LLM chain
     answer_chain = create_stuff_documents_chain(
         llm=llm, prompt=prompt_template, document_prompt=document_prompt
     )
+    response = answer_chain.invoke({"context": reranked_docs, "input": question})
+    answer_text = (
+        response.get("answer") or response.get("output_text") or str(response)
+        if isinstance(response, dict) else str(response)
+    )
 
-    # FIXED: Changed "input_documents" to "context"
-    response = answer_chain.invoke({"context": docs, "input": question})
-
-    if isinstance(response, dict):
-        answer_text = (
-            response.get("answer")
-            or response.get("output_text")
-            or str(response)
-        )
-    else:
-        answer_text = str(response)
-
-    # 4. Extract sources array matching [Source 1], [Source 2] order
+    # 4. Extract source metadata matching [Source 1], [Source 2] order
     sources = [
-        _extract_source_info(doc, i) for i, doc in enumerate(docs, start=1)
+        _extract_source_info(doc, i) for i, doc in enumerate(reranked_docs, start=1)
     ]
 
     return {"answer": answer_text, "sources": sources}
