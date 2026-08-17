@@ -5,13 +5,17 @@ import json
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 from dotenv import load_dotenv
+import fitz
+import torch
 
 # Docling Imports
-from docling.chunking import HybridChunker, HierarchicalChunker
+from docling.chunking import HybridChunker
 from docling.datamodel.base_models import InputFormat
 from docling.datamodel.pipeline_options import (
     PdfPipelineOptions,
     RapidOcrOptions,
+    AcceleratorOptions,
+    AcceleratorDevice
 )
 from docling.document_converter import DocumentConverter, PdfFormatOption
 from langchain_google_community import VertexAIRank
@@ -50,6 +54,9 @@ COLLECTION_NAME = os.getenv("COLLECTION_NAME", "internal_documents")
 GCP_PROJECT_ID = os.getenv("GCP_PROJECT_ID")
 GCP_LOCATION = os.getenv("GCP_LOCATION", "global")
 
+os.environ["DOCLING_DEVICE"] = "cpu"
+os.environ["TORCHDYNAMO_DISABLE"] = "1"
+
 FETCH_K = 50
 FINAL_K = 10
 
@@ -61,6 +68,7 @@ if key_path:
 # MODELS & PROMPTS SETUP
 # ==========================================
 embeddings_model = OllamaEmbeddings(model="nomic-embed-text")
+
 
 llm = ChatGoogleGenerativeAI(
     model="gemini-3.5-flash",
@@ -108,8 +116,6 @@ rag_chain = None
 
 # Reranker configuration
 logger = logging.getLogger(__name__)
-
-
 
 
 def _get_compressed_retriever(store: Chroma) -> ContextualCompressionRetriever:
@@ -181,63 +187,55 @@ def _load_text_documents(file_path: Path) -> List[Document]:
     return docs
 
 
-def load_documents_from_folder(target_files: List[str] = None) -> List[Document]:
+def load_documents_from_folder(target_files: Optional[List[str]] = None) -> List[Document]:
     if not DOCS_DIR.exists():
         raise FileNotFoundError(f"Document folder not found: {DOCS_DIR}")
 
     documents: List[Document] = []
-    pdf_paths: List[str] = []
+    pdf_paths: List[Path] = []
 
-    # 1. Determine which paths to look for
-    if target_files:
-        # Resolve names against DOCS_DIR or use direct path strings
-        candidate_paths = [
-            DOCS_DIR / f if not Path(f).is_absolute() else Path(f) 
-            for f in target_files
-        ]
-    else:
-        candidate_paths = sorted(DOCS_DIR.iterdir())
+    # 1. Determine candidate files
+    candidate_paths = (
+        [DOCS_DIR / f if not Path(f).is_absolute() else Path(f) for f in target_files]
+        if target_files else sorted(DOCS_DIR.iterdir())
+    )
 
-    # 2. Iterate through candidate files
+    # 2. Separate text files and PDF paths
     for file_path in candidate_paths:
         if not file_path.exists():
-            logger.warning(f"File not found, skipping: {file_path}")
             continue
-
         if file_path.suffix.lower() in {".txt", ".md"}:
             documents.extend(_load_text_documents(file_path))
         elif file_path.suffix.lower() == ".pdf":
-            pdf_paths.append(str(file_path))
+            pdf_paths.append(file_path)
 
-    # Process PDFs with Docling as usual
+    # 3. Pass PDFs directly to Docling (No PyMuPDF rendering step)
     if pdf_paths:
-        pipeline_options = PdfPipelineOptions()
+        pipeline_options = PdfPipelineOptions(
+            accelerator_options=AcceleratorOptions(
+            device=AcceleratorDevice.CPU  # Bypasses MPS float64 crash entirely
+    )
+)
         pipeline_options.do_ocr = True
-        pipeline_options.images_scale = 3.0
-        pipeline_options.ocr_options = RapidOcrOptions()
+        pipeline_options.ocr_options = RapidOcrOptions(backend="paddle")
 
         custom_converter = DocumentConverter(
+            allowed_formats=[InputFormat.PDF],
             format_options={
                 InputFormat.PDF: PdfFormatOption(pipeline_options=pipeline_options)
             }
         )
-        
-        hierarchical_chunker = HierarchicalChunker(
-            merge_list_items=True,
-            always_emit_headings=False
-        )
+
+        hybrid_chunker = HybridChunker(max_tokens=216, merge_peers=True)
 
         pdf_loader = DoclingLoader(
-            file_path=pdf_paths,
+            file_path=[str(p) for p in pdf_paths], # Absolute PDF paths
             export_type=ExportType.DOC_CHUNKS,
-            chunker=hierarchical_chunker,
+            chunker=hybrid_chunker,
             converter=custom_converter,
             meta_extractor=PageAwareMetaExtractor(),
         )
         documents.extend(pdf_loader.load())
-
-    if not documents:
-        raise ValueError("No supported or existing documents were provided for ingestion.")
 
     return documents
 
@@ -308,23 +306,37 @@ def ingest_documents(target_files: Optional[List[str]] = None) -> Dict[str, int]
 
     return {"chunks_indexed": len(final_chunks), "documents_loaded": len(raw_docs)}
 
-def preview_chroma_chunks(limit: int = 5, chars: int = 400) -> List[Dict[str, Any]]:
+def preview_chroma_chunks(
+    limit: int = 5, 
+    chars: int = 400, 
+    filename: Optional[str] = None
+) -> List[Dict[str, Any]]:
     """Returns previews of chunks directly from the Chroma vector store."""
     if vector_store is None:
         return []
 
+    # Optional metadata filter for a specific filename
+    where_clause = {"source": filename} if filename else None
+
     # Fetch stored chunks and metadata directly from Chroma
-    data = vector_store.get(limit=limit, include=["documents", "metadatas"])
+    data = vector_store.get(
+        limit=limit, 
+        where=where_clause,
+        include=["documents", "metadatas"]
+    )
 
     previews: List[Dict[str, Any]] = []
     documents = data.get("documents") or []
     metadatas = data.get("metadatas") or []
 
     for text, meta in zip(documents, metadatas):
+        # Create a clean metadata copy excluding bounding box arrays (dl_prov)
+        clean_meta = {k: v for k, v in meta.items() if k != "dl_prov"}
+        
         previews.append(
             {
                 "text": text[:chars],
-                "metadata": meta,
+                "metadata": clean_meta,
             }
         )
 

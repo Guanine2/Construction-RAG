@@ -1,6 +1,6 @@
 from typing import Dict, Tuple, List, Optional
 from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 import uvicorn
 import io
 from fastapi.responses import Response
@@ -26,9 +26,12 @@ class QueryRequest(BaseModel):
 
 
 class PreviewRequest(BaseModel):
-    limit: int = 5
-    chars: int = 400
-
+    limit: int = Field(default=5, ge=1, le=100)
+    chars: int = Field(default=400, ge=1)
+    filename: Optional[str] = Field(
+        default=None, 
+        description="Optional source filename to filter chunks (e.g., 'blueprint.pdf')"
+    )
 class HighlightRequest(BaseModel):
     source: str
     page_number: int
@@ -131,11 +134,14 @@ def ingest_endpoint(request: Optional[IngestRequest] = None) -> dict:
 def preview_chunks_endpoint(request: PreviewRequest) -> dict:
     try:
         return {
-            "chunks": preview_chroma_chunks(limit=request.limit, chars=request.chars),
+            "chunks": preview_chroma_chunks(
+                limit=request.limit, 
+                chars=request.chars, 
+                filename=request.filename
+            ),
         }
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc))
-
 
 @app.post("/ask")
 def ask_endpoint(request: QueryRequest) -> dict:
