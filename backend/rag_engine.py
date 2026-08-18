@@ -3,7 +3,7 @@ import os
 import time
 import json
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 from dotenv import load_dotenv
 import fitz
 import torch
@@ -186,58 +186,154 @@ def _load_text_documents(file_path: Path) -> List[Document]:
         })
     return docs
 
+def _extract_shx_text_thorough(annot: fitz.Annot) -> str:
+    """Extracts text from SHX annotation dictionary fields."""
+    info = annot.info
+    text = (
+        info.get("content") 
+        or info.get("subject") 
+        or info.get("title") 
+        or ""
+    ).strip()
+    
+    if not text and hasattr(annot, "get_text"):
+        text = annot.get_text().strip()
+        
+    return text
 
-def load_documents_from_folder(target_files: Optional[List[str]] = None) -> List[Document]:
+def load_documents_from_folder(target_files: Optional[List[str]] = None) -> Tuple[List[Document], Dict[str, str]]:
     if not DOCS_DIR.exists():
         raise FileNotFoundError(f"Document folder not found: {DOCS_DIR}")
 
     documents: List[Document] = []
-    pdf_paths: List[Path] = []
+    scanned_pages_to_ocr: List[Tuple[Path, int]] = []
+    file_report: Dict[str, str] = {}
 
-    # 1. Determine candidate files
     candidate_paths = (
         [DOCS_DIR / f if not Path(f).is_absolute() else Path(f) for f in target_files]
         if target_files else sorted(DOCS_DIR.iterdir())
     )
 
-    # 2. Separate text files and PDF paths
     for file_path in candidate_paths:
         if not file_path.exists():
             continue
-        if file_path.suffix.lower() in {".txt", ".md"}:
-            documents.extend(_load_text_documents(file_path))
-        elif file_path.suffix.lower() == ".pdf":
-            pdf_paths.append(file_path)
 
-    # 3. Pass PDFs directly to Docling (No PyMuPDF rendering step)
-    if pdf_paths:
+        if file_path.suffix.lower() in {".txt", ".md"}:
+            txt_docs = _load_text_documents(file_path)
+            for d in txt_docs:
+                d.metadata["extraction_method"] = "raw_text"
+            documents.extend(txt_docs)
+            file_report[file_path.name] = "raw_text"
+
+        elif file_path.suffix.lower() == ".pdf":
+            doc = fitz.open(str(file_path))
+            file_has_pymupdf_data = False
+
+            for page_idx, page in enumerate(doc):
+                page_num = page_idx + 1  # 1-based page index
+                page_has_data = False
+
+                # 1. ATOMIC SHX CHUNKING: 1 SHX Comment = 1 Dedicated Chunk
+                for annot in page.annots():
+                    shx_text = _extract_shx_text_thorough(annot)
+                    if shx_text:
+                        page_has_data = True
+                        file_has_pymupdf_data = True
+                        rect = annot.rect
+                        bbox = [float(rect.x0), float(rect.y0), float(rect.x1), float(rect.y1)]
+
+                        # Single-item provenance payload matching the exact SHX bbox
+                        prov = [{
+                            "page_no": page_num,
+                            "bbox": bbox,
+                            "type": "shx_annotation"
+                        }]
+
+                        # Create isolated document chunk
+                        shx_chunk = Document(
+                            page_content=shx_text,
+                            metadata={
+                                "source": file_path.name,
+                                "file_type": "pdf",
+                                "page_number": page_num,
+                                "page_numbers": str(page_num),
+                                "extraction_method": "shx_annotation",
+                                "bbox": bbox,                  # Direct list [x0, y0, x1, y1]
+                                "dl_prov": json.dumps(prov)     # Formatted for /render-highlight
+                            }
+                        )
+                        documents.append(shx_chunk)
+
+                # 2. ATOMIC VECTOR TEXT CHUNKING: 1 Native Text Block = 1 Dedicated Chunk
+                blocks = page.get_text("blocks")
+                for b in blocks:
+                    if b[6] == 0 and b[4].strip():  # Type 0 = Text block
+                        text_content = b[4].strip()
+                        page_has_data = True
+                        file_has_pymupdf_data = True
+                        bbox = [float(b[0]), float(b[1]), float(b[2]), float(b[3])]
+
+                        prov = [{
+                            "page_no": page_num,
+                            "bbox": bbox,
+                            "type": "native_text"
+                        }]
+
+                        vector_chunk = Document(
+                            page_content=text_content,
+                            metadata={
+                                "source": file_path.name,
+                                "file_type": "pdf",
+                                "page_number": page_num,
+                                "page_numbers": str(page_num),
+                                "extraction_method": "pymupdf_native_text",
+                                "bbox": bbox,
+                                "dl_prov": json.dumps(prov)
+                            }
+                        )
+                        documents.append(vector_chunk)
+
+                # Track unmapped scanned pages for OCR fallback
+                if not page_has_data:
+                    scanned_pages_to_ocr.append((file_path, page_num))
+
+            file_report[file_path.name] = (
+                "pymupdf_native_shx" if file_has_pymupdf_data else "docling_ocr_fallback"
+            )
+
+    # 3. OCR Fallback Pass (For scanned pages missing vector/SHX content)
+    if scanned_pages_to_ocr:
+        ocr_pdf_paths = list(set([p[0] for p in scanned_pages_to_ocr]))
+        
         pipeline_options = PdfPipelineOptions(
-            accelerator_options=AcceleratorOptions(
-            device=AcceleratorDevice.CPU  # Bypasses MPS float64 crash entirely
-    )
-)
+            accelerator_options=AcceleratorOptions(device=AcceleratorDevice.CPU)
+        )
         pipeline_options.do_ocr = True
         pipeline_options.ocr_options = RapidOcrOptions(backend="paddle")
 
         custom_converter = DocumentConverter(
             allowed_formats=[InputFormat.PDF],
-            format_options={
-                InputFormat.PDF: PdfFormatOption(pipeline_options=pipeline_options)
-            }
+            format_options={InputFormat.PDF: PdfFormatOption(pipeline_options=pipeline_options)}
         )
 
-        hybrid_chunker = HybridChunker(max_tokens=216, merge_peers=True)
-
         pdf_loader = DoclingLoader(
-            file_path=[str(p) for p in pdf_paths], # Absolute PDF paths
+            file_path=[str(p) for p in ocr_pdf_paths],
             export_type=ExportType.DOC_CHUNKS,
-            chunker=hybrid_chunker,
+            chunker=HybridChunker(max_tokens=216, merge_peers=True),
             converter=custom_converter,
             meta_extractor=PageAwareMetaExtractor(),
         )
-        documents.extend(pdf_loader.load())
+        
+        existing_page_keys = {(d.metadata["source"], d.metadata["page_number"]) for d in documents}
+        for ocr_doc in pdf_loader.load():
+            src = ocr_doc.metadata.get("source")
+            pg = ocr_doc.metadata.get("page_number", 1)
+            
+            if (src, pg) not in existing_page_keys:
+                ocr_doc.metadata["extraction_method"] = "docling_ocr"
+                documents.append(ocr_doc)
 
-    return documents
+    return documents, file_report
 
 
 # ==========================================
@@ -263,8 +359,8 @@ def ingest_documents(target_files: Optional[List[str]] = None) -> Dict[str, int]
     """Ingests documents into ChromaDB and re-attaches the compressed retriever."""
     global vector_store, retriever, rag_chain
 
-    raw_docs = load_documents_from_folder(target_files=target_files)
-    
+    raw_docs, file_report = load_documents_from_folder(target_files=target_files)   
+     
     final_chunks: List[Document] = []
     text_splitter = RecursiveCharacterTextSplitter(
         chunk_size=1200,

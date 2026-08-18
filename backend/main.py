@@ -1,4 +1,4 @@
-from typing import Dict, Tuple, List, Optional
+from typing import Dict, Tuple, List, Optional, Union
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 import uvicorn
@@ -6,6 +6,7 @@ import io
 from fastapi.responses import Response
 import fitz 
 from PIL import Image, ImageDraw
+import json
 
 
 # Import engine logic
@@ -39,74 +40,91 @@ class HighlightRequest(BaseModel):
 
 class IngestRequest(BaseModel):
     files: Optional[List[str]] = None
-    
+
+
+def parse_and_normalize_bboxes(dl_prov_raw: Union[str, List, Dict]) -> List[List[float]]:
+    """
+    Parses 'dl_prov' and converts any bbox format (PyMuPDF list or Docling dict)
+    into standard [x0, y0, x1, y1] float lists.
+    """
+    # 1. Deserialize string if passed as raw JSON from ChromaDB
+    if isinstance(dl_prov_raw, str):
+        try:
+            dl_prov_raw = json.loads(dl_prov_raw)
+        except Exception:
+            return []
+
+    # 2. Ensure we are working with a list of provenance items
+    prov_list = dl_prov_raw if isinstance(dl_prov_raw, list) else [dl_prov_raw]
+
+    normalized_bboxes = []
+
+    for item in prov_list:
+        if not isinstance(item, dict):
+            continue
+            
+        bbox = item.get("bbox")
+        if not bbox:
+            continue
+
+        # Case A: BBox is already a list [x0, y0, x1, y1] (PyMuPDF format)
+        if isinstance(bbox, list) and len(bbox) >= 4:
+            normalized_bboxes.append([float(bbox[0]), float(bbox[1]), float(bbox[2]), float(bbox[3])])
+
+        # Case B: BBox is a dict (Docling / PDFKit format)
+        elif isinstance(bbox, dict):
+            # Handles {'l': x0, 't': y0, 'r': x1, 'b': y1} or {'x0': ..., 'y0': ...}
+            x0 = bbox.get("l") or bbox.get("x0") or bbox.get("left", 0)
+            y0 = bbox.get("t") or bbox.get("y0") or bbox.get("top", 0)
+            x1 = bbox.get("r") or bbox.get("x1") or bbox.get("right", 0)
+            y1 = bbox.get("b") or bbox.get("y1") or bbox.get("bottom", 0)
+            normalized_bboxes.append([float(x0), float(y0), float(x1), float(y1)])
+
+    return normalized_bboxes
 
 @app.post("/render-highlight")
-def render_highlight_endpoint(req: HighlightRequest):
-    cache_key = (req.source, req.page_number)
-    
-    # 1. Standardize 300 DPI target scale
-    TARGET_DPI = 300
-    scale_factor = TARGET_DPI / 72.0  # Scale multiplier (4.1667) for bounding box coordinates
-
+def render_highlight_endpoint(payload: HighlightRequest):
     try:
-        if cache_key in PAGE_CACHE:
-            base_img, page_h = PAGE_CACHE[cache_key]
-        else:
-            pdf_path = DOCS_DIR / req.source
-            if not pdf_path.exists():
-                raise HTTPException(status_code=404, detail="PDF file not found")
+        pdf_path = DOCS_DIR / payload.source
+        if not pdf_path.exists():
+            raise HTTPException(status_code=404, detail="PDF file not found")
 
-            doc = fitz.open(pdf_path)
-            page_idx = max(0, req.page_number - 1)
-            page = doc.load_page(page_idx)
+        doc = fitz.open(str(pdf_path))
+        
+        # Validate 1-based page index range
+        if payload.page_number < 1 or payload.page_number > len(doc):
+            raise HTTPException(status_code=400, detail="Page number out of range")
 
-            # RENDER CRISP AT 300 DPI DIRECTLY
-            pix = page.get_pixmap(dpi=TARGET_DPI)
+        page = doc.load_page(payload.page_number - 1)  # 0-based indexing for PyMuPDF
 
-            base_img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
-            page_h = page.rect.height
+        # Parse and normalize bounding boxes safely from Pydantic payload
+        bboxes = parse_and_normalize_bboxes(payload.dl_prov)
 
-            # Cache the pristine high-res 300 DPI base image
-            PAGE_CACHE[cache_key] = (base_img, page_h)
-
-        # 2. Draw high-precision boxes on crisp image copy
-        img = base_img.copy()
-        draw = ImageDraw.Draw(img, "RGBA")
-
-        for prov in req.dl_prov:
-            bbox = prov.get("bbox")
-            if not bbox:
-                continue
-
-            l, t, r, b = bbox["l"], bbox["t"], bbox["r"], bbox["b"]
-            origin = str(bbox.get("coord_origin", "BOTTOMLEFT")).upper()
-
-            if "BOTTOM" in origin:
-                top_pt = page_h - t
-                bottom_pt = page_h - b
-            else:
-                top_pt = t
-                bottom_pt = b
-
-            # Scale PDF points (72 DPI base) to match 300 DPI image canvas
-            x0, x1 = min(l, r) * scale_factor, max(l, r) * scale_factor
-            y0, y1 = min(top_pt, bottom_pt) * scale_factor, max(top_pt, bottom_pt) * scale_factor
-
-            draw.rectangle(
-                [x0, y0, x1, y1],
-                fill=(255, 235, 59, 90),
-                outline=(255, 152, 0, 255),
-                width=3,
+        shape = page.new_shape()
+        
+        # Draw highlight rectangles over image canvas
+        for bbox in bboxes:
+            rect = fitz.Rect(bbox)
+            
+            # Draw filled rectangle with translucent opacity
+            shape.draw_rect(rect)
+            shape.finish(
+                fill=(1, 1, 0),        # RGB Yellow fill
+                fill_opacity=0.35,     # 35% opacity (translucent marker effect)
+                color=(1, 0.8, 0),     # Optional subtle border (RGB Gold/Orange)
+                width=0.5
             )
 
-        img_byte_arr = io.BytesIO()
-        img.save(img_byte_arr, format="PNG")
-        return Response(content=img_byte_arr.getvalue(), media_type="image/png")
+        shape.commit()
+        # Render 300 DPI image
+        pix = page.get_pixmap(dpi=300)
+        img_bytes = pix.tobytes("png")
 
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        return Response(content=img_bytes, media_type="image/png")
 
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Highlight rendering error: {str(exc)}")
+    
 @app.on_event("startup")
 def startup_event() -> None:
     build_or_reload_chain()
