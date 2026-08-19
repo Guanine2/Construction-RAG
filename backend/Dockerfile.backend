@@ -1,0 +1,38 @@
+FROM python:3.11-slim
+
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    DOCLING_DEVICE="cpu" \
+    TORCHDYNAMO_DISABLE="1"
+
+# Install system C-libraries, OpenCV dependencies, and curl
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    curl \
+    ca-certificates \
+    libgl1 \
+    libglib2.0-0 \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install Ollama binary engine
+RUN curl -fsSL https://ollama.com/install.sh | sh
+
+WORKDIR /app
+
+# Install Python requirements
+COPY backend/requirements.txt ./backend/requirements.txt
+RUN pip install --no-cache-dir -r backend/requirements.txt
+
+# Bake nomic-embed-text model weights into the Docker layer during build phase
+RUN ollama serve & \
+    PID=$! && \
+    sleep 5 && \
+    ollama pull nomic-embed-text && \
+    kill $PID
+
+# Copy full application code and docs
+COPY . .
+
+RUN chmod +x /app/backend/entrypoint.sh
+
+ENTRYPOINT ["/app/backend/entrypoint.sh"]

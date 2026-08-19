@@ -9,15 +9,6 @@ from dotenv import load_dotenv
 import fitz
 import torch
 import re 
-from docling.chunking import HybridChunker
-from docling.datamodel.base_models import InputFormat
-from docling.datamodel.pipeline_options import (
-    PdfPipelineOptions,
-    RapidOcrOptions,
-    AcceleratorOptions,
-    AcceleratorDevice
-)
-from docling.document_converter import DocumentConverter, PdfFormatOption
 from langchain_google_community import VertexAIRank
 from langchain_classic.retrievers import ContextualCompressionRetriever
 
@@ -25,8 +16,7 @@ from langchain_chroma import Chroma
 from langchain_community.document_loaders import TextLoader
 from langchain_core.documents import Document
 from langchain_core.prompts import ChatPromptTemplate, PromptTemplate
-from langchain_docling import DoclingLoader
-from langchain_docling.loader import BaseMetaExtractor, ExportType
+from langchain_docling.loader import BaseMetaExtractor
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_ollama import OllamaEmbeddings
 from langchain_text_splitters import RecursiveCharacterTextSplitter, Language
@@ -113,6 +103,69 @@ retriever = None
 rag_chain = None
 
 logger = logging.getLogger(__name__)
+
+def _make_cad_doc(text: str, bbox: List[float], page_num: int, file_name: str, method: str) -> Document:
+    """Helper to instantiate standardized LangChain Documents with spatial provenance metadata."""
+    prov = [{"page_no": page_num, "bbox": bbox, "type": method}]
+    return Document(
+        page_content=text,
+        metadata={
+            "source": file_name,
+            "file_type": "pdf",
+            "page_number": page_num,
+            "page_numbers": str(page_num),
+            "extraction_method": method,
+            "bbox": json.dumps(bbox),
+            "dl_prov": json.dumps(prov),
+        }
+    )
+
+
+def _create_shx_annotation_doc(text: str, rect: fitz.Rect, page_num: int, file_name: str) -> Document:
+    """Treats a single SHX annotation as an individual Document chunk."""
+    return _make_cad_doc(
+        text, 
+        [float(rect.x0), float(rect.y0), float(rect.x1), float(rect.y1)], 
+        page_num, 
+        file_name, 
+        "shx_annotation"
+    )
+
+
+def _chunk_native_text_spatially(
+    page: fitz.Page,
+    page_num: int,
+    file_name: str,
+    max_chars: int = 1200,
+    max_gap: float = 25.0
+) -> List[Document]:
+    """Extracts native text blocks and chunks them using spatial distance thresholds."""
+    blocks = sorted(
+        [{"text": b[4].strip(), "bbox": [float(x) for x in b[:4]]} for b in page.get_text("blocks") if b[4].strip()],
+        key=lambda b: (b["bbox"][1], b["bbox"][0])
+    )
+    if not blocks:
+        return []
+
+    docs, cur_txt, cur_box = [], [], []
+
+    def flush():
+        if cur_txt:
+            env = [min(b[0] for b in cur_box), min(b[1] for b in cur_box), max(b[2] for b in cur_box), max(b[3] for b in cur_box)]
+            docs.append(_make_cad_doc("\n\n".join(cur_txt), env, page_num, file_name, "pymupdf_native_spatial"))
+            cur_txt.clear()
+            cur_box.clear()
+
+    for b in blocks:
+        if cur_box:
+            prev_ymax, curr_ymin = cur_box[-1][3], b["bbox"][1]
+            if (curr_ymin - prev_ymax > max_gap) or (curr_ymin < prev_ymax - 15.0) or (sum(map(len, cur_txt)) >= max_chars):
+                flush()
+        cur_txt.append(b["text"])
+        cur_box.append(b["bbox"])
+
+    flush()
+    return docs
 
 def _extract_page_vlm_html(page: fitz.Page, page_num: int) -> str:
     """Renders a PDF page to image and extracts structured HTML with bounding boxes using Gemini."""
@@ -294,9 +347,6 @@ def _extract_shx_text_thorough(annot: fitz.Annot) -> str:
 
 
 def load_documents_from_folder(target_files: Optional[List[str]] = None) -> Tuple[List[Document], Dict[str, str]]:
-    """Loads documents using PyMuPDF for SHX annotations. Bypasses VLM only on pages with SHX data; 
-    routes all other pages (native vector text or scanned) through Gemini VLM HTML extraction.
-    """
     if not DOCS_DIR.exists():
         raise FileNotFoundError(f"Document folder not found: {DOCS_DIR}")
 
@@ -321,51 +371,30 @@ def load_documents_from_folder(target_files: Optional[List[str]] = None) -> Tupl
 
         elif file_path.suffix.lower() == ".pdf":
             doc = fitz.open(str(file_path))
-            shx_pages_count = 0
-            vlm_pages_count = 0
+            shx_pages_count, vlm_pages_count = 0, 0
 
             for page_idx, page in enumerate(doc):
                 page_num = page_idx + 1
-                shx_docs_on_page: List[Document] = []
 
-                # 1. Collect SHX annotations on the page
-                for annot in page.annots():
-                    shx_text = _extract_shx_text_thorough(annot)
-                    if shx_text:
-                        rect = annot.rect
-                        bbox = [float(rect.x0), float(rect.y0), float(rect.x1), float(rect.y1)]
-                        prov = [{"page_no": page_num, "bbox": bbox, "type": "shx_annotation"}]
+                # 1. Extract SHX annotations as individual 1:1 chunks
+                shx_docs = []
+                if page.annots():
+                    for annot in page.annots():
+                        shx_text = _extract_shx_text_thorough(annot)
+                        if shx_text:
+                            clean_text = shx_text.replace("AutoCAD SHX Text:", "").strip()
+                            if clean_text:
+                                shx_docs.append(_create_shx_annotation_doc(clean_text, annot.rect, page_num, file_path.name))
 
-                        shx_docs_on_page.append(
-                            Document(
-                                page_content=shx_text,
-                                metadata={
-                                    "source": file_path.name,
-                                    "file_type": "pdf",
-                                    "page_number": page_num,
-                                    "page_numbers": str(page_num),
-                                    "extraction_method": "shx_annotation",
-                                    "bbox": json.dumps(bbox),
-                                    "dl_prov": json.dumps(prov)
-                                }
-                            )
-                        )
-
-                # 2. Routing logic
-                if shx_docs_on_page:
-                    # SHX annotations exist -> append SHX text and skip VLM
-                    documents.extend(shx_docs_on_page)
+                # 2. Route page based on SHX presence
+                if shx_docs:
+                    documents.extend(shx_docs)
+                    documents.extend(_chunk_native_text_spatially(page, page_num, file_path.name))
                     shx_pages_count += 1
                 else:
-                    # No SHX annotations (native vector text OR scanned) -> process via Gemini VLM
                     raw_html = _extract_page_vlm_html(page, page_num)
-                    
-                    html_filename = f"{Path(file_path).stem}_page_{page_num}.html"
-                    html_filepath = HTML_OUTPUT_DIR / html_filename
-                    html_filepath.write_text(raw_html, encoding="utf-8")
-                    
-                    vlm_docs = parse_vlm_html_to_documents(raw_html, file_path.name, page_num)
-                    documents.extend(vlm_docs)
+                    (HTML_OUTPUT_DIR / f"{Path(file_path).stem}_page_{page_num}.html").write_text(raw_html, encoding="utf-8")
+                    documents.extend(parse_vlm_html_to_documents(raw_html, file_path.name, page_num))
                     vlm_pages_count += 1
 
             file_report[file_path.name] = f"shx_pages({shx_pages_count})_vlm_pages({vlm_pages_count})"
