@@ -1,13 +1,14 @@
 import logging
 import os
 import time
+import base64
 import json
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 from dotenv import load_dotenv
 import fitz
 import torch
-
+import re 
 from docling.chunking import HybridChunker
 from docling.datamodel.base_models import InputFormat
 from docling.datamodel.pipeline_options import (
@@ -28,7 +29,8 @@ from langchain_docling import DoclingLoader
 from langchain_docling.loader import BaseMetaExtractor, ExportType
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_ollama import OllamaEmbeddings
-from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain_text_splitters import RecursiveCharacterTextSplitter, Language
+from langchain_core.messages import HumanMessage
 
 from langchain_classic.chains import create_retrieval_chain
 from langchain_classic.chains.combine_documents import create_stuff_documents_chain
@@ -46,6 +48,8 @@ COLLECTION_NAME = os.getenv("COLLECTION_NAME", "internal_documents")
 
 GCP_PROJECT_ID = os.getenv("GCP_PROJECT_ID")
 GCP_LOCATION = os.getenv("GCP_LOCATION", "global")
+HTML_OUTPUT_DIR = PROJECT_ROOT / "extracted_html"
+HTML_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 os.environ["DOCLING_DEVICE"] = "cpu"
 os.environ["TORCHDYNAMO_DISABLE"] = "1"
@@ -98,11 +102,96 @@ document_prompt = PromptTemplate.from_template(
     "Document Content:\n{page_content}\n"
 )
 
+html_splitter = RecursiveCharacterTextSplitter.from_language(
+    language=Language.HTML,
+    chunk_size=1000,
+    chunk_overlap=150
+)
+
 vector_store = None
 retriever = None
 rag_chain = None
 
 logger = logging.getLogger(__name__)
+
+def _extract_page_vlm_html(page: fitz.Page, page_num: int) -> str:
+    """Renders a PDF page to image and extracts structured HTML with bounding boxes using Gemini."""
+    # Render at 200 DPI for high CAD text clarity
+    pix = page.get_pixmap(dpi=300)
+    base64_image = base64.b64encode(pix.tobytes("png")).decode("utf-8")
+
+    prompt = f"""
+    You are a high-precision document intelligence engine performing layout-aware text extraction.
+
+    TASK:
+    Extract ALL text from the provided document page while maintaining visual hierarchy.
+
+    OUTPUT FORMAT:
+    Return clean, semantic HTML directly as a single-line string. Do NOT output markdown code blocks (e.g., ```html). Do NOT include literal newline characters (\\n).
+
+    EXTRACTION RULES:
+    1. Top-Level Page Wrapper: Wrap the entire page content in a root <section> tag containing `data-page="{page_num}"`.
+    2. Logical Grouping: Wrap visually or semantically related groups of elements (e.g., site plans, zoning tables, general notes) in nested <section> tags.
+    3. Bounding Boxes: Include `data-bbox="[ymin, xmin, ymax, xmax]"` (scaled 0-1000) on all structural tags (<section>, <h1>-<h6>, <p>, <table>, <div>).
+    4. Semantic Hierarchy: Use semantic tags (<h1>-<h6> for headers, <p> for text/notes, <table> for schedules/tables).
+    5. Fidelity: Transcribe all text, numbers, dimensions, and codes EXACTLY as printed without summarization.
+    6. Single Line Constraint: Do NOT insert line breaks or newlines anywhere in the string. Output everything on one continuous line.
+    """
+
+    message = HumanMessage(
+        content=[
+            {"type": "text", "text": prompt},
+            {
+                "type": "image_url",
+                "image_url": {"url": f"data:image/png;base64,{base64_image}"},
+            },
+        ]
+    )
+
+    response = llm.invoke([message])
+    content = str(response.content).strip()
+
+    # Clean codeblock wrapping if model still generates it
+    if content.startswith("```"):
+        content = content.split("\n", 1)[-1]
+    if content.endswith("```"):
+        content = content.rsplit("```", 1)[0]
+
+    return content.strip()
+
+def parse_vlm_html_to_documents(raw_html: str, file_name: str, page_num: int) -> List[Document]:
+    """Splits raw Gemini VLM HTML into chunked LangChain Documents with parsed bounding box metadata."""
+    chunks = html_splitter.split_text(raw_html)
+    documents = []
+
+    for idx, chunk in enumerate(chunks):
+        # Extract highest-level bounding box found inside the chunk HTML snippet
+        bbox_match = re.search(r'data-bbox="\[(.*?)\]"', chunk)
+        bbox = [float(x.strip()) for x in bbox_match.group(1).split(",")] if bbox_match else []
+
+        prov = [{
+            "page_no": page_num,
+            "type": "gemini_vlm_ocr",
+            "bbox": bbox,
+            "chunk_index": idx
+        }]
+
+        documents.append(
+            Document(
+                page_content=chunk,
+                metadata={
+                    "source": file_name,
+                    "file_type": "pdf",
+                    "page_number": page_num,
+                    "page_numbers": str(page_num),
+                    "extraction_method": "gemini_vlm_ocr",
+                    "bbox": json.dumps(bbox),
+                    "dl_prov": json.dumps(prov),
+                }
+            )
+        )
+
+    return documents
 
 
 def _get_compressed_retriever(store: Chroma) -> ContextualCompressionRetriever:
@@ -205,22 +294,13 @@ def _extract_shx_text_thorough(annot: fitz.Annot) -> str:
 
 
 def load_documents_from_folder(target_files: Optional[List[str]] = None) -> Tuple[List[Document], Dict[str, str]]:
-    """Loads documents using PyMuPDF for native/SHX vectors and Docling OCR as a fallback for scanned pages.
-
-    Args:
-        target_files (Optional[List[str]]): Optional list of filenames to target within the document folder.
-
-    Returns:
-        Tuple[List[Document], Dict[str, str]]: A tuple containing the extracted Document objects and a per-file extraction method report.
-
-    Raises:
-        FileNotFoundError: Raised if the document directory does not exist.
+    """Loads documents using PyMuPDF for SHX annotations. Bypasses VLM only on pages with SHX data; 
+    routes all other pages (native vector text or scanned) through Gemini VLM HTML extraction.
     """
     if not DOCS_DIR.exists():
         raise FileNotFoundError(f"Document folder not found: {DOCS_DIR}")
 
     documents: List[Document] = []
-    scanned_pages_to_ocr: List[Tuple[Path, int]] = []
     file_report: Dict[str, str] = {}
 
     candidate_paths = (
@@ -241,21 +321,22 @@ def load_documents_from_folder(target_files: Optional[List[str]] = None) -> Tupl
 
         elif file_path.suffix.lower() == ".pdf":
             doc = fitz.open(str(file_path))
-            file_has_pymupdf_data = False
+            shx_pages_count = 0
+            vlm_pages_count = 0
 
             for page_idx, page in enumerate(doc):
                 page_num = page_idx + 1
-                page_has_data = False
+                shx_docs_on_page: List[Document] = []
 
+                # 1. Collect SHX annotations on the page
                 for annot in page.annots():
                     shx_text = _extract_shx_text_thorough(annot)
                     if shx_text:
-                        page_has_data = file_has_pymupdf_data = True
                         rect = annot.rect
                         bbox = [float(rect.x0), float(rect.y0), float(rect.x1), float(rect.y1)]
                         prov = [{"page_no": page_num, "bbox": bbox, "type": "shx_annotation"}]
 
-                        documents.append(
+                        shx_docs_on_page.append(
                             Document(
                                 page_content=shx_text,
                                 metadata={
@@ -264,66 +345,30 @@ def load_documents_from_folder(target_files: Optional[List[str]] = None) -> Tupl
                                     "page_number": page_num,
                                     "page_numbers": str(page_num),
                                     "extraction_method": "shx_annotation",
-                                    "bbox": bbox,
+                                    "bbox": json.dumps(bbox),
                                     "dl_prov": json.dumps(prov)
                                 }
                             )
                         )
 
-                for b in page.get_text("blocks"):
-                    if b[6] == 0 and b[4].strip():
-                        page_has_data = file_has_pymupdf_data = True
-                        bbox = [float(b[0]), float(b[1]), float(b[2]), float(b[3])]
-                        prov = [{"page_no": page_num, "bbox": bbox, "type": "native_text"}]
+                # 2. Routing logic
+                if shx_docs_on_page:
+                    # SHX annotations exist -> append SHX text and skip VLM
+                    documents.extend(shx_docs_on_page)
+                    shx_pages_count += 1
+                else:
+                    # No SHX annotations (native vector text OR scanned) -> process via Gemini VLM
+                    raw_html = _extract_page_vlm_html(page, page_num)
+                    
+                    html_filename = f"{Path(file_path).stem}_page_{page_num}.html"
+                    html_filepath = HTML_OUTPUT_DIR / html_filename
+                    html_filepath.write_text(raw_html, encoding="utf-8")
+                    
+                    vlm_docs = parse_vlm_html_to_documents(raw_html, file_path.name, page_num)
+                    documents.extend(vlm_docs)
+                    vlm_pages_count += 1
 
-                        documents.append(
-                            Document(
-                                page_content=b[4].strip(),
-                                metadata={
-                                    "source": file_path.name,
-                                    "file_type": "pdf",
-                                    "page_number": page_num,
-                                    "page_numbers": str(page_num),
-                                    "extraction_method": "pymupdf_native_text",
-                                    "bbox": bbox,
-                                    "dl_prov": json.dumps(prov)
-                                }
-                            )
-                        )
-
-                if not page_has_data:
-                    scanned_pages_to_ocr.append((file_path, page_num))
-
-            file_report[file_path.name] = "pymupdf_native_shx" if file_has_pymupdf_data else "docling_ocr_fallback"
-
-    if scanned_pages_to_ocr:
-        ocr_pdf_paths = list({p[0] for p in scanned_pages_to_ocr})
-        pipeline_options = PdfPipelineOptions(
-            accelerator_options=AcceleratorOptions(device=AcceleratorDevice.CPU),
-            do_ocr=True,
-            ocr_options=RapidOcrOptions(backend="paddle")
-        )
-
-        custom_converter = DocumentConverter(
-            allowed_formats=[InputFormat.PDF],
-            format_options={InputFormat.PDF: PdfFormatOption(pipeline_options=pipeline_options)}
-        )
-
-        pdf_loader = DoclingLoader(
-            file_path=[str(p) for p in ocr_pdf_paths],
-            export_type=ExportType.DOC_CHUNKS,
-            chunker=HybridChunker(max_tokens=216, merge_peers=True),
-            converter=custom_converter,
-            meta_extractor=PageAwareMetaExtractor(),
-        )
-        
-        existing_keys = {(d.metadata["source"], d.metadata["page_number"]) for d in documents}
-        for ocr_doc in pdf_loader.load():
-            src = ocr_doc.metadata.get("source")
-            pg = ocr_doc.metadata.get("page_number", 1)
-            if (src, pg) not in existing_keys:
-                ocr_doc.metadata["extraction_method"] = "docling_ocr"
-                documents.append(ocr_doc)
+            file_report[file_path.name] = f"shx_pages({shx_pages_count})_vlm_pages({vlm_pages_count})"
 
     return documents, file_report
 

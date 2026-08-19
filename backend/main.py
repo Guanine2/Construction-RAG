@@ -42,21 +42,23 @@ class IngestRequest(BaseModel):
     files: Optional[List[str]] = None
 
 
-def parse_and_normalize_bboxes(dl_prov_raw: Union[str, List, Dict]) -> List[List[float]]:
+# --- Helper Function: BBox Parser & Normalizer ---
+def parse_and_normalize_bboxes(
+    dl_prov_raw: Union[str, List, Dict],
+    page_width: float = 0.0,
+    page_height: float = 0.0
+) -> List[List[float]]:
     """
-    Parses 'dl_prov' and converts any bbox format (PyMuPDF list or Docling dict)
-    into standard [x0, y0, x1, y1] float lists.
+    Parses 'dl_prov' and converts any bbox format (PyMuPDF, Gemini VLM, or Docling)
+    into standard [x0, y0, x1, y1] float lists scaled to actual PDF points.
     """
-    # 1. Deserialize string if passed as raw JSON from ChromaDB
     if isinstance(dl_prov_raw, str):
         try:
             dl_prov_raw = json.loads(dl_prov_raw)
         except Exception:
             return []
 
-    # 2. Ensure we are working with a list of provenance items
     prov_list = dl_prov_raw if isinstance(dl_prov_raw, list) else [dl_prov_raw]
-
     normalized_bboxes = []
 
     for item in prov_list:
@@ -67,13 +69,28 @@ def parse_and_normalize_bboxes(dl_prov_raw: Union[str, List, Dict]) -> List[List
         if not bbox:
             continue
 
-        # Case A: BBox is already a list [x0, y0, x1, y1] (PyMuPDF format)
-        if isinstance(bbox, list) and len(bbox) >= 4:
+        method = item.get("type") or item.get("extraction_method", "")
+
+        # CASE 1: Gemini VLM Format ([ymin, xmin, ymax, xmax] normalized 0-1000)
+        if method == "gemini_vlm_ocr" or (
+            isinstance(bbox, list) and len(bbox) >= 4 and all(v <= 1000 for v in bbox[:4])
+        ):
+            ymin, xmin, ymax, xmax = float(bbox[0]), float(bbox[1]), float(bbox[2]), float(bbox[3])
+            
+            # Swap axes to (x0, y0, x1, y1) and scale 0-1000 -> actual PDF points
+            x0 = (xmin / 1000.0) * page_width if page_width else xmin
+            y0 = (ymin / 1000.0) * page_height if page_height else ymin
+            x1 = (xmax / 1000.0) * page_width if page_width else xmax
+            y1 = (ymax / 1000.0) * page_height if page_height else ymax
+            
+            normalized_bboxes.append([x0, y0, x1, y1])
+
+        # CASE 2: PyMuPDF / SHX Format ([x0, y0, x1, y1] absolute points)
+        elif isinstance(bbox, list) and len(bbox) >= 4:
             normalized_bboxes.append([float(bbox[0]), float(bbox[1]), float(bbox[2]), float(bbox[3])])
 
-        # Case B: BBox is a dict (Docling / PDFKit format)
+        # CASE 3: Dict Format ({'l': x0, 't': y0, 'r': x1, 'b': y1})
         elif isinstance(bbox, dict):
-            # Handles {'l': x0, 't': y0, 'r': x1, 'b': y1} or {'x0': ..., 'y0': ...}
             x0 = bbox.get("l") or bbox.get("x0") or bbox.get("left", 0)
             y0 = bbox.get("t") or bbox.get("y0") or bbox.get("top", 0)
             x1 = bbox.get("r") or bbox.get("x1") or bbox.get("right", 0)
@@ -82,6 +99,8 @@ def parse_and_normalize_bboxes(dl_prov_raw: Union[str, List, Dict]) -> List[List
 
     return normalized_bboxes
 
+
+# --- FastAPI Endpoint ---
 @app.post("/render-highlight")
 def render_highlight_endpoint(payload: HighlightRequest):
     try:
@@ -90,38 +109,45 @@ def render_highlight_endpoint(payload: HighlightRequest):
             raise HTTPException(status_code=404, detail="PDF file not found")
 
         doc = fitz.open(str(pdf_path))
-        
-        # Validate 1-based page index range
+
         if payload.page_number < 1 or payload.page_number > len(doc):
             raise HTTPException(status_code=400, detail="Page number out of range")
 
-        page = doc.load_page(payload.page_number - 1)  # 0-based indexing for PyMuPDF
+        # 1. Load 0-indexed page
+        page = doc.load_page(payload.page_number - 1)
 
-        # Parse and normalize bounding boxes safely from Pydantic payload
-        bboxes = parse_and_normalize_bboxes(payload.dl_prov)
+        # 2. Get exact PDF canvas dimensions in points
+        page_width = page.rect.width
+        page_height = page.rect.height
 
+        # 3. Normalize bboxes (automatically detects VLM vs PyMuPDF)
+        bboxes = parse_and_normalize_bboxes(
+            dl_prov_raw=payload.dl_prov,
+            page_width=page_width,
+            page_height=page_height
+        )
+
+        # 4. Draw highlights onto canvas
         shape = page.new_shape()
-        
-        # Draw highlight rectangles over image canvas
         for bbox in bboxes:
-            rect = fitz.Rect(bbox)
-            
-            # Draw filled rectangle with translucent opacity
+            rect = fitz.Rect(bbox)  # Guaranteed to be [x0, y0, x1, y1] in PDF points
             shape.draw_rect(rect)
             shape.finish(
-                fill=(1, 1, 0),        # RGB Yellow fill
-                fill_opacity=0.35,     # 35% opacity (translucent marker effect)
-                color=(1, 0.8, 0),     # Optional subtle border (RGB Gold/Orange)
+                fill=(1, 1, 0),        # Translucent Yellow
+                fill_opacity=0.35,
+                color=(1, 0.8, 0),     # Border outline
                 width=0.5
             )
-
         shape.commit()
-        # Render 300 DPI image
+
+        # 5. Render 300 DPI high-res output preview image
         pix = page.get_pixmap(dpi=300)
         img_bytes = pix.tobytes("png")
 
         return Response(content=img_bytes, media_type="image/png")
 
+    except HTTPException:
+        raise
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Highlight rendering error: {str(exc)}")
     
