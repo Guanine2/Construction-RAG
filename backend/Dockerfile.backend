@@ -17,8 +17,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 # Install Ollama binary directly
-RUN curl -fsSL https://ollama.com/download/ollama-linux-amd64.tgz | tar zx -C /usr
-
+RUN curl -fsSL https://ollama.com/download/ollama-linux-amd64.tar.zst | zstd -d | tar x -C /usr
 WORKDIR /app/backend
 
 # Copy and install Python dependencies
