@@ -1,22 +1,39 @@
 import io
+import os
 import requests
 import streamlit as st
 from PIL import Image
+import google.auth.transport.requests
+import google.oauth2.id_token
 
-# Page setup
+
 st.set_page_config(
     page_title="Document Intelligence RAG", page_icon="🏗️", layout="wide"
 )
+BACKEND_URL = os.getenv("BACKEND_URL", "http://localhost:8000").rstrip("/")
 
-# Sidebar Configuration
-st.sidebar.header("⚙️ Settings")
 API_BASE_URL = st.sidebar.text_input(
-    "FastAPI Base URL", value="http://localhost:8000"
-)
+    "FastAPI Base URL", value=BACKEND_URL
+).rstrip("/")
+
+def get_auth_headers(target_url: str) -> dict:
+    """Generates an OIDC ID Token for Cloud Run service-to-service authentication."""
+    if "localhost" in target_url or "127.0.0.1" in target_url:
+        return {}  # Skip token header during local Mac testing
+    
+    try:
+        auth_req = google.auth.transport.requests.Request()
+        token = google.oauth2.id_token.fetch_id_token(auth_req, target_url)
+        return {"Authorization": f"Bearer {token}"}
+    except Exception as err:
+        st.error(f"Authentication token generation failed: {err}")
+        return {}
+
+
 
 # Health Check Indicator
 try:
-    health_res = requests.get(f"{API_BASE_URL}/health", timeout=3)
+    health_res = requests.get(f"{API_BASE_URL}/health", headers=get_auth_headers(API_BASE_URL), timeout=3)
     if health_res.status_code == 200:
         st.sidebar.success("Backend Connected 🟢")
     else:
@@ -39,6 +56,7 @@ if st.sidebar.button("Preview Chunks", use_container_width=True):
         res = requests.post(
             f"{API_BASE_URL}/preview-chunks",
             json={"limit": limit, "chars": chars},
+            headers=get_auth_headers(API_BASE_URL),
             timeout=10,
         )
         if res.status_code == 200:
@@ -75,6 +93,7 @@ def view_citation_modal(source_item: dict):
                     "page_number": page_no,
                     "dl_prov": source_item.get("dl_prov", []),
                 },
+                headers=get_auth_headers(API_BASE_URL),
                 timeout=15,
             )
             if response.status_code == 200:
@@ -138,7 +157,7 @@ if prompt := st.chat_input("Ask a question about your project docs..."):
 
         try:
             res = requests.post(
-                f"{API_BASE_URL}/ask", json={"question": prompt}, timeout=60
+                f"{API_BASE_URL}/ask", json={"question": prompt}, headers=get_auth_headers(API_BASE_URL), timeout=60
             )
 
             if res.status_code == 200:

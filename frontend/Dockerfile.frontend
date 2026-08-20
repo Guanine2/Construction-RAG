@@ -6,7 +6,7 @@ ENV PYTHONUNBUFFERED=1 \
 WORKDIR /app
 
 # Install lightweight Streamlit dependencies
-RUN pip install --no-cache-dir streamlit requests pillow
+RUN pip install --no-cache-dir streamlit requests pillow google-auth
 
 # Ensure destination ends with a trailing slash
 COPY app.py /app/
