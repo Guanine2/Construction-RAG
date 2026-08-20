@@ -16,3 +16,5 @@ langchain-ollama>=0.1.0
 langchain-text-splitters>=0.2.0
 langchain-docling>=0.1.0
 chromadb>=0.5.0
+google-cloud-discoveryengine
+langchain-google-community[vertexai]
