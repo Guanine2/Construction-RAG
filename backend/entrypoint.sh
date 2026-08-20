@@ -10,4 +10,4 @@ while ! curl -s http://localhost:11434/api/tags > /dev/null; do
 done
 
 echo "Ollama is ready. Starting FastAPI application..."
-exec uvicorn backend.main:app --host 0.0.0.0 --port ${PORT:-8000}
+exec uvicorn main:app --host 0.0.0.0 --port ${PORT:-8000}

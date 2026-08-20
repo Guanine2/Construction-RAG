@@ -20,7 +20,7 @@ RUN curl -fsSL https://ollama.com/install.sh | sh
 WORKDIR /app
 
 # Install Python requirements
-COPY requirements.txt
+COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 # Bake nomic-embed-text model weights into the Docker layer during build phase
