@@ -2,7 +2,6 @@ from typing import Dict, Tuple, List, Optional, Union
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 import uvicorn
-import io
 from fastapi.responses import Response
 import fitz 
 from PIL import Image, ImageDraw

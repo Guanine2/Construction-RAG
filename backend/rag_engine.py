@@ -1,13 +1,11 @@
 import logging
 import os
-import time
 import base64
 import json
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 from dotenv import load_dotenv
 import fitz
-import torch
 import re 
 from langchain_google_community import VertexAIRank
 from langchain_classic.retrievers import ContextualCompressionRetriever
