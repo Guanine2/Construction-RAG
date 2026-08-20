@@ -2,9 +2,10 @@ FROM python:3.11-slim
 
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
-    PYTHONPATH=/app
+    PYTHONPATH=/app \
+    OLLAMA_MODELS=/root/.ollama/models
 
-# Install system C-libraries, OpenCV dependencies, and curl
+# Install system dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
     curl \
@@ -12,27 +13,29 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libgl1 \
     libglib2.0-0 \
     zstd \
+    procps \
     && rm -rf /var/lib/apt/lists/*
 
-# Install Ollama binary engine
-RUN curl -fsSL https://ollama.com/install.sh | sh
+# Install Ollama binary directly
+RUN curl -fsSL https://ollama.com/download/ollama-linux-amd64.tgz | tar zx -C /usr
 
-WORKDIR /app
+WORKDIR /app/backend
 
-# Install Python requirements
+# Copy and install Python dependencies
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Bake nomic-embed-text model weights into the Docker layer during build phase
+# Bake nomic-embed-text weights into container with active health check
 RUN ollama serve & \
     PID=$! && \
-    sleep 5 && \
+    while ! curl -s http://localhost:11434/api/tags > /dev/null; do sleep 1; done && \
     ollama pull nomic-embed-text && \
     kill $PID
 
-# Copy full application code and docs
+# Copy application source code
 COPY . .
 
-RUN chmod +x entrypoint.sh
+# Fix potential Windows CRLF line-ending issues & set permissions
+RUN sed -i 's/\r$//' entrypoint.sh && chmod +x entrypoint.sh
 
 ENTRYPOINT ["./entrypoint.sh"]
