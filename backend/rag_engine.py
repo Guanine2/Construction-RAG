@@ -34,7 +34,7 @@ CHROMA_DIR = PROJECT_ROOT / "chroma_db" / "langchain_document_intelligence"
 
 COLLECTION_NAME = os.getenv("COLLECTION_NAME", "internal_documents")
 
-GCP_PROJECT_ID = os.getenv("GCP_PROJECT_ID")
+GCP_PROJECT_ID = os.getenv("GCP_PROJECT_ID", "construction-rag-505118")
 GCP_LOCATION = os.getenv("GCP_LOCATION", "global")
 HTML_OUTPUT_DIR = PROJECT_ROOT / "extracted_html"
 HTML_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
