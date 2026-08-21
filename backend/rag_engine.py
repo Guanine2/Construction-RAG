@@ -14,7 +14,6 @@ from langchain_chroma import Chroma
 from langchain_community.document_loaders import TextLoader
 from langchain_core.documents import Document
 from langchain_core.prompts import ChatPromptTemplate, PromptTemplate
-from langchain_docling.loader import BaseMetaExtractor
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_ollama import OllamaEmbeddings
 from langchain_text_splitters import RecursiveCharacterTextSplitter, Language
@@ -38,6 +37,7 @@ GCP_PROJECT_ID = os.getenv("GCP_PROJECT_ID", "construction-rag-505118")
 GCP_LOCATION = os.getenv("GCP_LOCATION", "global")
 HTML_OUTPUT_DIR = PROJECT_ROOT / "extracted_html"
 HTML_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
 
 FETCH_K = 50
 FINAL_K = 10
@@ -257,54 +257,6 @@ def _get_compressed_retriever(store: Chroma) -> ContextualCompressionRetriever:
         base_retriever=base_retriever
     )
     
-
-class PageAwareMetaExtractor(BaseMetaExtractor):
-    """Metadata extractor that parses page numbers and provenance details from Docling objects."""
-
-    def extract_chunk_meta(self, file_path: str, chunk: Any) -> Dict[str, Any]:
-        """Extracts chunk-level metadata including page numbers and bounding box provenance.
-
-        Args:
-            file_path (str): Path to the source file being processed.
-            chunk (Any): The Docling chunk object containing document metadata and items.
-
-        Returns:
-            Dict[str, Any]: Extracted metadata containing page numbers, source filename, and serialized provenance JSON.
-        """
-        dl_meta = chunk.meta.export_json_dict() if hasattr(chunk, "meta") else {}
-        page_numbers, prov_list = [], []
-
-        if "doc_items" in dl_meta:
-            for item in dl_meta["doc_items"]:
-                for prov in item.get("prov", []):
-                    if "page_no" in prov:
-                        page_numbers.append(prov["page_no"])
-                    elif "page_number" in prov:
-                        page_numbers.append(prov["page_number"])
-                    if "bbox" in prov:
-                        prov_list.append(prov)
-
-        unique_pages = sorted(list(set(page_numbers)))
-        metadata: Dict[str, Any] = {
-            "source": Path(file_path).name,
-            "file_type": "pdf",
-            "page_number": unique_pages[0] if unique_pages else 1,
-            "page_numbers": ", ".join(map(str, unique_pages)) if unique_pages else "N/A",
-            "dl_prov": json.dumps(prov_list)
-        }
-        return metadata
-
-    def extract_dl_doc_meta(self, file_path: str, dl_doc: Any) -> Dict[str, Any]:
-        """Extracts top-level metadata for a processed Docling document instance.
-
-        Args:
-            file_path (str): Path to the source file.
-            dl_doc (Any): The top-level Docling document instance.
-
-        Returns:
-            Dict[str, Any]: Basic document metadata containing source filename and file type.
-        """
-        return {"source": Path(file_path).name, "file_type": "pdf"}
 
 
 def _load_text_documents(file_path: Path) -> List[Document]:
