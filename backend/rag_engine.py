@@ -5,7 +5,7 @@ import json
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 from dotenv import load_dotenv
-import fitz
+import pymupdf as fitz
 import re 
 from langchain_google_community import VertexAIRank
 from langchain_classic.retrievers import ContextualCompressionRetriever
@@ -114,17 +114,137 @@ def _make_cad_doc(text: str, bbox: List[float], page_num: int, file_name: str, m
             "dl_prov": json.dumps(prov),
         }
     )
+def _box_distance(b1: List[float], b2: List[float]) -> float:
+    """Calculates the minimum edge-to-edge distance between two bounding boxes [x0, y0, x1, y1]."""
+    dx = max(0.0, b1[0] - b2[2], b2[0] - b1[2])
+    dy = max(0.0, b1[1] - b2[3], b2[1] - b1[3])
+    return (dx ** 2 + dy ** 2) ** 0.5
 
-
-def _create_shx_annotation_doc(text: str, rect: fitz.Rect, page_num: int, file_name: str) -> Document:
-    """Treats a single SHX annotation as an individual Document chunk."""
-    return _make_cad_doc(
-        text, 
-        [float(rect.x0), float(rect.y0), float(rect.x1), float(rect.y1)], 
-        page_num, 
-        file_name, 
-        "shx_annotation"
+def _make_cad_doc_multi_bbox(
+    text: str,
+    boxes: List[List[float]],
+    page_num: int,
+    file_name: str,
+    method: str
+) -> Document:
+    """Creates a Document keeping all individual annotation bounding boxes in dl_prov."""
+    prov = [{"page_no": page_num, "bbox": b, "type": method} for b in boxes]
+    
+    # Macro bounding box enclosing all items for top-level metadata
+    enclosing_bbox = [
+        min(b[0] for b in boxes),
+        min(b[1] for b in boxes),
+        max(b[2] for b in boxes),
+        max(b[3] for b in boxes)
+    ]
+    
+    return Document(
+        page_content=text,
+        metadata={
+            "source": file_name,
+            "file_type": "pdf",
+            "page_number": page_num,
+            "page_numbers": str(page_num),
+            "extraction_method": method,
+            "bbox": json.dumps(enclosing_bbox),
+            "dl_prov": json.dumps(prov),
+        }
     )
+
+
+def _chunk_shx_annotations(
+    page: fitz.Page,
+    page_num: int,
+    file_name: str,
+    min_word_cutoff: int = 10
+) -> List[Document]:
+    annots = page.annots()
+    if not annots:
+        return []
+
+    extracted = []
+    seen = set()
+
+    for annot in annots:
+        shx_text = _extract_shx_text_thorough(annot)
+        if shx_text:
+            clean_text = shx_text.replace("AutoCAD SHX Text:", "").strip()
+            if clean_text:
+                raw_rect = annot.rect
+                bbox = [float(raw_rect.x0), float(raw_rect.y0), float(raw_rect.x1), float(raw_rect.y1)]
+                
+                dedup_key = (clean_text, round(raw_rect.x0, 1), round(raw_rect.y0, 1))
+                if dedup_key not in seen:
+                    seen.add(dedup_key)
+                    extracted.append({
+                        "text": clean_text,
+                        "bbox": bbox
+                    })
+
+    if not extracted:
+        return []
+
+    # Initialize each extracted annotation as its own spatial cluster
+    clusters = [{"texts": [item["text"]], "boxes": [item["bbox"]]} for item in extracted]
+
+    def cluster_envelope(cluster: dict) -> List[float]:
+        boxes = cluster["boxes"]
+        return [
+            min(b[0] for b in boxes),
+            min(b[1] for b in boxes),
+            max(b[2] for b in boxes),
+            max(b[3] for b in boxes)
+        ]
+
+    def cluster_word_count(cluster: dict) -> int:
+        return len(" ".join(cluster["texts"]).split())
+
+    # Iterative spatial merging loop for short clusters
+    while len(clusters) > 1:
+        # Find the first cluster containing <= min_word_cutoff words
+        short_idx = None
+        for idx, cl in enumerate(clusters):
+            if cluster_word_count(cl) <= min_word_cutoff:
+                short_idx = idx
+                break
+
+        # Stop merging if all remaining clusters exceed min_word_cutoff words
+        if short_idx is None:
+            break
+
+        short_cluster = clusters[short_idx]
+        short_env = cluster_envelope(short_cluster)
+
+        # Find the geometrically closest neighbor cluster on the 2D canvas
+        best_neighbor_idx = None
+        min_dist = float("inf")
+
+        for idx, other_cl in enumerate(clusters):
+            if idx == short_idx:
+                continue
+            dist = _box_distance(short_env, cluster_envelope(other_cl))
+            if dist < min_dist:
+                min_dist = dist
+                best_neighbor_idx = idx
+
+        if best_neighbor_idx is not None:
+            # Merge short_cluster into its nearest spatial neighbor
+            target = clusters[best_neighbor_idx]
+            target["texts"].extend(short_cluster["texts"])
+            target["boxes"].extend(short_cluster["boxes"])
+            clusters.pop(short_idx)
+        else:
+            break
+
+    # Convert finalized spatial clusters into LangChain Documents
+    docs: List[Document] = []
+    for cl in clusters:
+        combined_text = " ".join(cl["texts"])
+        docs.append(
+            _make_cad_doc_multi_bbox(combined_text, cl["boxes"], page_num, file_name, "shx_annotation")
+        )
+
+    return docs
 
 
 def _chunk_native_text_spatially(
@@ -323,15 +443,8 @@ def load_documents_from_folder(target_files: Optional[List[str]] = None) -> Tupl
             for page_idx, page in enumerate(doc):
                 page_num = page_idx + 1
 
-                # 1. Extract SHX annotations as individual 1:1 chunks
-                shx_docs = []
-                if page.annots():
-                    for annot in page.annots():
-                        shx_text = _extract_shx_text_thorough(annot)
-                        if shx_text:
-                            clean_text = shx_text.replace("AutoCAD SHX Text:", "").strip()
-                            if clean_text:
-                                shx_docs.append(_create_shx_annotation_doc(clean_text, annot.rect, page_num, file_path.name))
+                # 1. Extract & chunk SHX annotations (accumulates <= 10 word notes)
+                shx_docs = _chunk_shx_annotations(page, page_num, file_path.name)
 
                 # 2. Route page based on SHX presence
                 if shx_docs:
