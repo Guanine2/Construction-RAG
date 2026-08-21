@@ -3,7 +3,7 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 import uvicorn
 from fastapi.responses import Response
-import fitz 
+import pymupdf as fitz 
 from PIL import Image, ImageDraw
 import json
 
@@ -71,9 +71,8 @@ def parse_and_normalize_bboxes(
         method = item.get("type") or item.get("extraction_method", "")
 
         # CASE 1: Gemini VLM Format ([ymin, xmin, ymax, xmax] normalized 0-1000)
-        if method == "gemini_vlm_ocr" or (
-            isinstance(bbox, list) and len(bbox) >= 4 and all(v <= 1000 for v in bbox[:4])
-        ):
+        # Rely primarily on method name to prevent misclassifying small absolute PDF points
+        if method == "gemini_vlm_ocr":
             ymin, xmin, ymax, xmax = float(bbox[0]), float(bbox[1]), float(bbox[2]), float(bbox[3])
             
             # Swap axes to (x0, y0, x1, y1) and scale 0-1000 -> actual PDF points
@@ -84,9 +83,21 @@ def parse_and_normalize_bboxes(
             
             normalized_bboxes.append([x0, y0, x1, y1])
 
-        # CASE 2: PyMuPDF / SHX Format ([x0, y0, x1, y1] absolute points)
-        elif isinstance(bbox, list) and len(bbox) >= 4:
-            normalized_bboxes.append([float(bbox[0]), float(bbox[1]), float(bbox[2]), float(bbox[3])])
+        # CASE 2: PyMuPDF / SHX / Native Text Format ([x0, y0, x1, y1] absolute points)
+        elif method in {"shx_annotation", "pymupdf_native_spatial", "pymupdf_native_text"} or (
+            isinstance(bbox, list) and len(bbox) >= 4
+        ):
+            # If no method specified, fallback: check if coordinates exceed 1000 or if x1 > x0
+            # If all values <= 1000 AND method is untagged, we check if it looks like VLM
+            if not method and all(v <= 1000 for v in bbox[:4]) and (page_width > 1000 or page_height > 1000):
+                ymin, xmin, ymax, xmax = float(bbox[0]), float(bbox[1]), float(bbox[2]), float(bbox[3])
+                x0 = (xmin / 1000.0) * page_width if page_width else xmin
+                y0 = (ymin / 1000.0) * page_height if page_height else ymin
+                x1 = (xmax / 1000.0) * page_width if page_width else xmax
+                y1 = (ymax / 1000.0) * page_height if page_height else ymax
+                normalized_bboxes.append([x0, y0, x1, y1])
+            else:
+                normalized_bboxes.append([float(bbox[0]), float(bbox[1]), float(bbox[2]), float(bbox[3])])
 
         # CASE 3: Dict Format ({'l': x0, 't': y0, 'r': x1, 'b': y1})
         elif isinstance(bbox, dict):
@@ -98,7 +109,6 @@ def parse_and_normalize_bboxes(
 
     return normalized_bboxes
 
-
 # --- FastAPI Endpoint ---
 @app.post("/render-highlight")
 def render_highlight_endpoint(payload: HighlightRequest):
@@ -107,41 +117,35 @@ def render_highlight_endpoint(payload: HighlightRequest):
         if not pdf_path.exists():
             raise HTTPException(status_code=404, detail="PDF file not found")
 
-        doc = fitz.open(str(pdf_path))
+        # Context manager guarantees doc.close() executes on C level
+        with fitz.open(str(pdf_path)) as doc:
+            if payload.page_number < 1 or payload.page_number > len(doc):
+                raise HTTPException(status_code=400, detail="Page number out of range")
 
-        if payload.page_number < 1 or payload.page_number > len(doc):
-            raise HTTPException(status_code=400, detail="Page number out of range")
+            page = doc.load_page(payload.page_number - 1)
+            page_width = page.rect.width
+            page_height = page.rect.height
 
-        # 1. Load 0-indexed page
-        page = doc.load_page(payload.page_number - 1)
-
-        # 2. Get exact PDF canvas dimensions in points
-        page_width = page.rect.width
-        page_height = page.rect.height
-
-        # 3. Normalize bboxes (automatically detects VLM vs PyMuPDF)
-        bboxes = parse_and_normalize_bboxes(
-            dl_prov_raw=payload.dl_prov,
-            page_width=page_width,
-            page_height=page_height
-        )
-
-        # 4. Draw highlights onto canvas
-        shape = page.new_shape()
-        for bbox in bboxes:
-            rect = fitz.Rect(bbox)  # Guaranteed to be [x0, y0, x1, y1] in PDF points
-            shape.draw_rect(rect)
-            shape.finish(
-                fill=(1, 1, 0),        # Translucent Yellow
-                fill_opacity=0.35,
-                color=(1, 0.8, 0),     # Border outline
-                width=0.5
+            bboxes = parse_and_normalize_bboxes(
+                dl_prov_raw=payload.dl_prov,
+                page_width=page_width,
+                page_height=page_height
             )
-        shape.commit()
 
-        # 5. Render 300 DPI high-res output preview image
-        pix = page.get_pixmap(dpi=300)
-        img_bytes = pix.tobytes("png")
+            shape = page.new_shape()
+            for bbox in bboxes:
+                rect = fitz.Rect(bbox)
+                shape.draw_rect(rect)
+                shape.finish(
+                    fill=(1, 1, 0),
+                    fill_opacity=0.35,
+                    color=(1, 0.8, 0),
+                    width=0.5
+                )
+            shape.commit()
+
+            pix = page.get_pixmap(dpi=300)
+            img_bytes = pix.tobytes("png")
 
         return Response(content=img_bytes, media_type="image/png")
 
