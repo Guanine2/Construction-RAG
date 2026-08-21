@@ -39,9 +39,6 @@ GCP_LOCATION = os.getenv("GCP_LOCATION", "global")
 HTML_OUTPUT_DIR = PROJECT_ROOT / "extracted_html"
 HTML_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
-os.environ["DOCLING_DEVICE"] = "cpu"
-os.environ["TORCHDYNAMO_DISABLE"] = "1"
-
 FETCH_K = 50
 FINAL_K = 10
 
