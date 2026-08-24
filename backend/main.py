@@ -54,7 +54,6 @@ async def upload_and_ingest(
     property_name: str = Form(...),
     files: List[UploadFile] = File(...)
 ):
-    # Sanitize property name for directory paths
     clean_prop_name = property_name.strip().replace(" ", "_")
     target_dir = DOCS_DIR / clean_prop_name
     target_dir.mkdir(parents=True, exist_ok=True)
@@ -67,11 +66,9 @@ async def upload_and_ingest(
             f.write(content)
         saved_files.append(file_path)
 
-    # Trigger ingestion passing property metadata
     result = ingest_documents(property_name=clean_prop_name, target_files=saved_files)
     return {"status": "success", "property": clean_prop_name, **result}
 
-# --- Helper Function: BBox Parser & Normalizer ---
 def parse_and_normalize_bboxes(
     dl_prov_raw: Union[str, List, Dict],
     page_width: float = 0.0,
