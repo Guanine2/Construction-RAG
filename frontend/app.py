@@ -21,7 +21,7 @@ def get_auth_headers(target_url: str) -> dict:
     """Generates an OIDC ID Token for Cloud Run service-to-service authentication."""
     if "localhost" in target_url or "127.0.0.1" in target_url:
         return {}
-    
+
     try:
         auth_req = google.auth.transport.requests.Request()
         token = google.oauth2.id_token.fetch_id_token(auth_req, target_url)
@@ -31,12 +31,11 @@ def get_auth_headers(target_url: str) -> dict:
         return {}
 
 
-# 1. Health Check Indicator
 try:
     health_res = requests.get(
-        f"{API_BASE_URL}/health", 
-        headers=get_auth_headers(API_BASE_URL), 
-        timeout=15
+        f"{API_BASE_URL}/health",
+        headers=get_auth_headers(API_BASE_URL),
+        timeout=15,
     )
     if health_res.status_code == 200:
         st.sidebar.success("Backend Connected 🟢")
@@ -47,13 +46,12 @@ except Exception:
 
 st.sidebar.markdown("---")
 
-# 2. Dynamic Property Context Selector (For Chat Querying)
 properties = []
 try:
     prop_res = requests.get(
-        f"{API_BASE_URL}/properties", 
+        f"{API_BASE_URL}/properties",
         headers=get_auth_headers(API_BASE_URL),
-        timeout=5
+        timeout=5,
     )
     if prop_res.status_code == 200:
         properties = prop_res.json().get("properties", [])
@@ -62,43 +60,43 @@ except Exception:
 
 selected_property = st.sidebar.selectbox(
     "🏢 Select Property Context",
-    options=["All"] + properties
+    options=["All"] + properties,
 )
 
 st.sidebar.markdown("---")
 
-# 3. Document Upload & Ingestion Section
 st.sidebar.subheader("📤 Upload & Ingest Documents")
 
-# Choose between selecting an existing property dropdown or creating a new one
 if properties:
     upload_mode = st.sidebar.radio(
         "Upload Target",
         options=["Existing Property", "➕ New Property"],
-        horizontal=True
+        horizontal=True,
     )
-    
+
     if upload_mode == "Existing Property":
         target_property = st.sidebar.selectbox(
             "Select Existing Property",
             options=properties,
-            key="upload_existing_prop_select"
+            key="upload_existing_prop_select",
         )
     else:
         target_property = st.sidebar.text_input(
-            "New Property Name", 
+            "New Property Name",
             placeholder="e.g., Oak_Ridge_Site",
-            key="upload_new_prop_input"
+            key="upload_new_prop_input",
         )
 else:
     target_property = st.sidebar.text_input(
-        "Property Name", 
+        "Property Name",
         placeholder="e.g., Oak_Ridge_Site",
-        key="upload_new_prop_input"
+        key="upload_new_prop_input",
     )
 
 uploaded_files = st.sidebar.file_uploader(
-    "Upload PDFs", accept_multiple_files=True, type=["pdf"]
+    "Upload PDFs",
+    accept_multiple_files=True,
+    type=["pdf"],
 )
 
 if st.sidebar.button("Ingest Files", use_container_width=True):
@@ -128,9 +126,9 @@ if st.sidebar.button("Ingest Files", use_container_width=True):
         st.sidebar.warning("Please provide a valid property name and select at least one PDF.")
 
 
-# --- MODAL DIALOG FOR CITATION HIGHLIGHT PREVIEW ---
 @st.dialog("📄 Citation Highlight Viewer", width="large")
 def view_citation_modal(source_item: dict):
+    """Display the highlighted PDF page associated with a source citation."""
     doc_name = source_item.get("source", "Unknown PDF")
     page_no = source_item.get("page_number", 1)
     citation_id = source_item.get("citation_id", 1)
@@ -161,7 +159,6 @@ def view_citation_modal(source_item: dict):
         except Exception as err:
             st.error(f"Could not connect to render endpoint: {err}")
 
-# --- MAIN UI: Chat Interface ---
 st.title("🏗️ Document Intelligence Assistant")
 st.caption(
     "Ask questions about your uploaded construction plans, specs, and documents."
@@ -172,7 +169,7 @@ if "messages" not in st.session_state:
 
 
 def render_citations(sources: list, msg_idx: int):
-    """Renders interactive citation buttons that open pop-up modals."""
+    """Render clickable citation buttons that open the matching highlight popup."""
     st.markdown("---")
     st.markdown("**Cited Sources:**")
     cols = st.columns(min(len(sources), 5))
@@ -183,19 +180,18 @@ def render_citations(sources: list, msg_idx: int):
         btn_label = f"📌 [Source {citation_id}]"
 
         if cols[col_idx].button(
-            btn_label, key=f"cite_btn_{msg_idx}_{citation_id}"
+            btn_label,
+            key=f"cite_btn_{msg_idx}_{citation_id}",
         ):
             view_citation_modal(src)
 
 
-# Render chat history
 for msg_idx, message in enumerate(st.session_state.messages):
     with st.chat_message(message["role"]):
         st.markdown(message["content"])
         if message.get("sources"):
             render_citations(message["sources"], msg_idx)
 
-# Handle user input
 if prompt := st.chat_input("Ask a question about your project docs..."):
     st.session_state.messages.append({"role": "user", "content": prompt})
     with st.chat_message("user"):

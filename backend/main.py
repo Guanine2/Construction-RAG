@@ -3,12 +3,10 @@ from fastapi import FastAPI, HTTPException, UploadFile, File, Form
 from pydantic import BaseModel, Field
 import uvicorn
 from fastapi.responses import Response
-import pymupdf as fitz 
+import pymupdf as fitz
 from PIL import Image, ImageDraw
 import json
 
-
-# Import engine logic
 from backend.rag_engine import (
     DOCS_DIR,
     build_or_reload_chain,
@@ -21,39 +19,54 @@ app = FastAPI(title="Document Intelligence RAG")
 
 PAGE_CACHE: Dict[Tuple[str, int], Tuple[Image.Image, float]] = {}
 
+
 class QueryRequest(BaseModel):
+    """Request payload for a natural-language question against the RAG index."""
+
     question: str
     property_name: Optional[str] = None
 
 
 class PreviewRequest(BaseModel):
+    """Request payload for previewing indexed chunk text and metadata."""
+
     limit: int = Field(default=5, ge=1, le=100)
     chars: int = Field(default=400, ge=1)
     filename: Optional[str] = Field(
-        default=None, 
-        description="Optional source filename to filter chunks (e.g., 'blueprint.pdf')"
+        default=None,
+        description="Optional source filename to filter chunks (e.g., 'blueprint.pdf')",
     )
+
+
 class HighlightRequest(BaseModel):
+    """Request payload for rendering a highlighted PDF page."""
+
     source: str
     page_number: int
     dl_prov: list
 
+
 class IngestRequest(BaseModel):
+    """Optional ingestion request wrapper for client-uploaded files."""
+
     files: Optional[List[str]] = None
+
 
 @app.get("/properties")
 def get_properties():
-    """Returns subdirectories in DOCS_DIR as available property names."""
+    """Return all available property directories in the configured documents folder."""
     if not DOCS_DIR.exists():
         return {"properties": []}
     properties = [d.name for d in DOCS_DIR.iterdir() if d.is_dir()]
     return {"properties": properties}
 
+
 @app.post("/upload-and-ingest")
 async def upload_and_ingest(
     property_name: str = Form(...),
-    files: List[UploadFile] = File(...)
+    files: List[UploadFile] = File(...),
 ):
+    """Persist uploaded PDF files and ingest them under a named property."""
     clean_prop_name = property_name.strip().replace(" ", "_")
     target_dir = DOCS_DIR / clean_prop_name
     target_dir.mkdir(parents=True, exist_ok=True)
@@ -69,15 +82,13 @@ async def upload_and_ingest(
     result = ingest_documents(property_name=clean_prop_name, target_files=saved_files)
     return {"status": "success", "property": clean_prop_name, **result}
 
+
 def parse_and_normalize_bboxes(
     dl_prov_raw: Union[str, List, Dict],
     page_width: float = 0.0,
-    page_height: float = 0.0
+    page_height: float = 0.0,
 ) -> List[List[float]]:
-    """
-    Parses 'dl_prov' and converts any bbox format (PyMuPDF, Gemini VLM, or Docling)
-    into standard [x0, y0, x1, y1] float lists scaled to actual PDF points.
-    """
+    """Normalize bounding-box provenance values into a consistent PDF coordinate layout."""
     if isinstance(dl_prov_raw, str):
         try:
             dl_prov_raw = json.loads(dl_prov_raw)
@@ -90,32 +101,26 @@ def parse_and_normalize_bboxes(
     for item in prov_list:
         if not isinstance(item, dict):
             continue
-            
+
         bbox = item.get("bbox")
         if not bbox:
             continue
 
         method = item.get("type") or item.get("extraction_method", "")
 
-        # CASE 1: Gemini VLM Format ([ymin, xmin, ymax, xmax] normalized 0-1000)
-        # Rely primarily on method name to prevent misclassifying small absolute PDF points
         if method == "gemini_vlm_ocr":
             ymin, xmin, ymax, xmax = float(bbox[0]), float(bbox[1]), float(bbox[2]), float(bbox[3])
-            
-            # Swap axes to (x0, y0, x1, y1) and scale 0-1000 -> actual PDF points
+
             x0 = (xmin / 1000.0) * page_width if page_width else xmin
             y0 = (ymin / 1000.0) * page_height if page_height else ymin
             x1 = (xmax / 1000.0) * page_width if page_width else xmax
             y1 = (ymax / 1000.0) * page_height if page_height else ymax
-            
+
             normalized_bboxes.append([x0, y0, x1, y1])
 
-        # CASE 2: PyMuPDF / SHX / Native Text Format ([x0, y0, x1, y1] absolute points)
         elif method in {"shx_annotation", "pymupdf_native_spatial", "pymupdf_native_text"} or (
             isinstance(bbox, list) and len(bbox) >= 4
         ):
-            # If no method specified, fallback: check if coordinates exceed 1000 or if x1 > x0
-            # If all values <= 1000 AND method is untagged, we check if it looks like VLM
             if not method and all(v <= 1000 for v in bbox[:4]) and (page_width > 1000 or page_height > 1000):
                 ymin, xmin, ymax, xmax = float(bbox[0]), float(bbox[1]), float(bbox[2]), float(bbox[3])
                 x0 = (xmin / 1000.0) * page_width if page_width else xmin
@@ -126,7 +131,6 @@ def parse_and_normalize_bboxes(
             else:
                 normalized_bboxes.append([float(bbox[0]), float(bbox[1]), float(bbox[2]), float(bbox[3])])
 
-        # CASE 3: Dict Format ({'l': x0, 't': y0, 'r': x1, 'b': y1})
         elif isinstance(bbox, dict):
             x0 = bbox.get("l") or bbox.get("x0") or bbox.get("left", 0)
             y0 = bbox.get("t") or bbox.get("y0") or bbox.get("top", 0)
@@ -136,15 +140,15 @@ def parse_and_normalize_bboxes(
 
     return normalized_bboxes
 
-# --- FastAPI Endpoint ---
+
 @app.post("/render-highlight")
 def render_highlight_endpoint(payload: HighlightRequest):
+    """Render a page image with the relevant source citation boxes highlighted."""
     try:
         pdf_path = DOCS_DIR / payload.source
         if not pdf_path.exists():
             raise HTTPException(status_code=404, detail="PDF file not found")
 
-        # Context manager guarantees doc.close() executes on C level
         with fitz.open(str(pdf_path)) as doc:
             if payload.page_number < 1 or payload.page_number > len(doc):
                 raise HTTPException(status_code=400, detail="Page number out of range")
@@ -156,7 +160,7 @@ def render_highlight_endpoint(payload: HighlightRequest):
             bboxes = parse_and_normalize_bboxes(
                 dl_prov_raw=payload.dl_prov,
                 page_width=page_width,
-                page_height=page_height
+                page_height=page_height,
             )
 
             shape = page.new_shape()
@@ -167,7 +171,7 @@ def render_highlight_endpoint(payload: HighlightRequest):
                     fill=(1, 1, 0),
                     fill_opacity=0.35,
                     color=(1, 0.8, 0),
-                    width=0.5
+                    width=0.5,
                 )
             shape.commit()
 
@@ -180,19 +184,23 @@ def render_highlight_endpoint(payload: HighlightRequest):
         raise
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Highlight rendering error: {str(exc)}")
-    
+
+
 @app.on_event("startup")
 def startup_event() -> None:
+    """Initialize the retrieval pipeline when the backend starts."""
     build_or_reload_chain()
 
 
 @app.get("/health")
 def health() -> dict:
+    """Return a simple backend health check response."""
     return {"status": "ok"}
 
 
 @app.post("/ingest")
 def ingest_endpoint(request: Optional[IngestRequest] = None) -> dict:
+    """Ingest documents from the request payload or the default property directory."""
     try:
         target_files = request.files if request else None
         result = ingest_documents(target_files=target_files)
@@ -203,21 +211,25 @@ def ingest_endpoint(request: Optional[IngestRequest] = None) -> dict:
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc))
 
+
 @app.post("/preview-chunks")
 def preview_chunks_endpoint(request: PreviewRequest) -> dict:
+    """Return a short preview of indexed chunks for debugging and review."""
     try:
         return {
             "chunks": preview_chroma_chunks(
-                limit=request.limit, 
-                chars=request.chars, 
-                filename=request.filename
+                limit=request.limit,
+                chars=request.chars,
+                filename=request.filename,
             ),
         }
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc))
 
+
 @app.post("/ask")
 def ask_endpoint(request: QueryRequest) -> dict:
+    """Submit a user question to the RAG system and return the grounded answer."""
     try:
         return ask_question(request.question)
     except Exception as exc:
