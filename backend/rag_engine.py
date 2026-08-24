@@ -2,6 +2,7 @@ import logging
 import os
 import base64
 import json
+import shutil
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 from dotenv import load_dotenv
@@ -14,31 +15,34 @@ from langchain_chroma import Chroma
 from langchain_community.document_loaders import TextLoader
 from langchain_core.documents import Document
 from langchain_core.prompts import ChatPromptTemplate, PromptTemplate
-from langchain_google_genai import ChatGoogleGenerativeAI
-from langchain_ollama import OllamaEmbeddings
+from langchain_google_genai import ChatGoogleGenerativeAI, GoogleGenerativeAIEmbeddings
 from langchain_text_splitters import RecursiveCharacterTextSplitter, Language
 from langchain_core.messages import HumanMessage
 
 from langchain_classic.chains import create_retrieval_chain
 from langchain_classic.chains.combine_documents import create_stuff_documents_chain
+from langchain_huggingface import HuggingFaceEmbeddings
 
 load_dotenv()
 
 BACKEND_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = BACKEND_DIR.parent
 
-DOCS_DIR = PROJECT_ROOT / "docs"
-
+# --- PATH & STORAGE SETUP ---
 if os.getenv("K_SERVICE"):
-    BASE_DATA_DIR = Path("/mnt/rag_data")
+    GCS_MOUNT_DIR = Path("/mnt/rag_data")
+    LOCAL_TMP_DIR = Path("/tmp")
 else:
-    BASE_DATA_DIR = Path(os.getenv("DATA_DIR", "./data")).resolve()
+    GCS_MOUNT_DIR = Path(os.getenv("DATA_DIR", "./data")).resolve()
+    LOCAL_TMP_DIR = GCS_MOUNT_DIR
 
-DOCS_DIR = BASE_DATA_DIR / "docs"
-CHROMA_DIR = BASE_DATA_DIR / "chroma_db"
+DOCS_DIR = GCS_MOUNT_DIR / "docs"
+GCS_CHROMA_DIR = GCS_MOUNT_DIR / "chroma_db"
+LOCAL_CHROMA_DIR = LOCAL_TMP_DIR / "chroma_db"
 
 DOCS_DIR.mkdir(parents=True, exist_ok=True)
-CHROMA_DIR.mkdir(parents=True, exist_ok=True)
+GCS_CHROMA_DIR.mkdir(parents=True, exist_ok=True)
+LOCAL_CHROMA_DIR.mkdir(parents=True, exist_ok=True)
 
 COLLECTION_NAME = os.getenv("COLLECTION_NAME", "internal_documents")
 
@@ -50,11 +54,17 @@ HTML_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 FETCH_K = 50
 FINAL_K = 10
 
+# Load credentials locally only (Cloud Run uses native Service Account ADC)
 key_path = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
-if key_path:
+if key_path and not os.getenv("K_SERVICE"):
     os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = str(PROJECT_ROOT / key_path)
 
-embeddings_model = OllamaEmbeddings(model="nomic-embed-text")
+# Cloud-native embedding model (removes local Ollama daemon dependency)
+embeddings_model = HuggingFaceEmbeddings(
+    model_name="perplexity-ai/pplx-embed-v1-0.6b",
+    model_kwargs={"trust_remote_code": True},
+    encode_kwargs={"normalize_embeddings": True},
+)
 
 llm = ChatGoogleGenerativeAI(
     model="gemini-3.5-flash",
@@ -106,6 +116,23 @@ retriever = None
 rag_chain = None
 
 logger = logging.getLogger(__name__)
+
+
+# --- GCS & LOCAL CHROMA SYNC HELPERS ---
+def get_active_chroma_dir() -> Path:
+    """Sync ChromaDB files from GCS FUSE to fast local container storage (/tmp) on boot."""
+    if os.getenv("K_SERVICE"):
+        if GCS_CHROMA_DIR.exists() and any(GCS_CHROMA_DIR.iterdir()):
+            if not any(LOCAL_CHROMA_DIR.iterdir()):
+                shutil.copytree(GCS_CHROMA_DIR, LOCAL_CHROMA_DIR, dirs_exist_ok=True)
+        return LOCAL_CHROMA_DIR
+    return GCS_CHROMA_DIR
+
+
+def sync_chroma_to_gcs() -> None:
+    """Sync updated local /tmp database back to GCS FUSE after document ingestion."""
+    if os.getenv("K_SERVICE") and LOCAL_CHROMA_DIR.exists():
+        shutil.copytree(LOCAL_CHROMA_DIR, GCS_CHROMA_DIR, dirs_exist_ok=True)
 
 
 def _make_cad_doc(
@@ -464,10 +491,10 @@ def build_or_reload_chain() -> None:
     """Reinitialize the vector store and retrieval chain from the current document set."""
     global vector_store, retriever, rag_chain
 
-    CHROMA_DIR.mkdir(parents=True, exist_ok=True)
+    active_dir = get_active_chroma_dir()
     vector_store = Chroma(
         collection_name=COLLECTION_NAME,
-        persist_directory=str(CHROMA_DIR),
+        persist_directory=str(active_dir),
         embedding_function=embeddings_model,
     )
     retriever = _get_compressed_retriever(vector_store)
@@ -504,12 +531,12 @@ def ingest_documents(
     for chunk in valid_chunks:
         chunk.metadata["property_name"] = property_name
 
-    CHROMA_DIR.mkdir(parents=True, exist_ok=True)
+    active_dir = get_active_chroma_dir()
 
     if vector_store is None:
         vector_store = Chroma(
             collection_name=COLLECTION_NAME,
-            persist_directory=str(CHROMA_DIR),
+            persist_directory=str(active_dir),
             embedding_function=embeddings_model,
         )
 
@@ -518,6 +545,7 @@ def ingest_documents(
         vector_store.add_documents(valid_chunks[i : i + batch_size])
 
     build_or_reload_chain()
+    sync_chroma_to_gcs()
 
     return {
         "chunks_indexed": len(valid_chunks),
