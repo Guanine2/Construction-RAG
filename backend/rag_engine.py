@@ -29,7 +29,18 @@ BACKEND_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = BACKEND_DIR.parent
 
 DOCS_DIR = PROJECT_ROOT / "docs"
-CHROMA_DIR = PROJECT_ROOT / "chroma_db" / "langchain_document_intelligence"
+
+if os.getenv("K_SERVICE"):
+    BASE_DATA_DIR = Path("/mnt/rag_data")
+else:
+    BASE_DATA_DIR = Path(os.getenv("DATA_DIR", "./data")).resolve()
+
+
+DOCS_DIR = BASE_DATA_DIR / "docs"
+CHROMA_DIR = BASE_DATA_DIR / "chroma_db"
+
+DOCS_DIR.mkdir(parents=True, exist_ok=True)
+CHROMA_DIR.mkdir(parents=True, exist_ok=True)
 
 COLLECTION_NAME = os.getenv("COLLECTION_NAME", "internal_documents")
 
@@ -413,20 +424,26 @@ def _extract_shx_text_thorough(annot: fitz.Annot) -> str:
     return text or (annot.get_text().strip() if hasattr(annot, "get_text") else "")
 
 
-def load_documents_from_folder(target_files: Optional[List[str]] = None) -> Tuple[List[Document], Dict[str, str]]:
-    if not DOCS_DIR.exists():
-        raise FileNotFoundError(f"Document folder not found: {DOCS_DIR}")
+
+def load_documents_from_folder(
+    property_name: str = "default",
+    target_files: Optional[List[str]] = None
+) -> Tuple[List[Document], Dict[str, str]]:
+    
+    # Target property-specific directory
+    prop_dir = DOCS_DIR / property_name
+    prop_dir.mkdir(parents=True, exist_ok=True)
 
     documents: List[Document] = []
     file_report: Dict[str, str] = {}
 
     candidate_paths = (
-        [DOCS_DIR / f if not Path(f).is_absolute() else Path(f) for f in target_files]
-        if target_files else sorted(DOCS_DIR.iterdir())
+        [prop_dir / f if not Path(f).is_absolute() else Path(f) for f in target_files]
+        if target_files else sorted(prop_dir.iterdir())
     )
 
     for file_path in candidate_paths:
-        if not file_path.exists():
+        if not file_path.exists() or file_path.is_dir():
             continue
 
         if file_path.suffix.lower() in {".txt", ".md"}:
@@ -443,10 +460,8 @@ def load_documents_from_folder(target_files: Optional[List[str]] = None) -> Tupl
             for page_idx, page in enumerate(doc):
                 page_num = page_idx + 1
 
-                # 1. Extract & chunk SHX annotations (accumulates <= 10 word notes)
                 shx_docs = _chunk_shx_annotations(page, page_num, file_path.name)
 
-                # 2. Route page based on SHX presence
                 if shx_docs:
                     documents.extend(shx_docs)
                     documents.extend(_chunk_native_text_spatially(page, page_num, file_path.name))
@@ -458,6 +473,10 @@ def load_documents_from_folder(target_files: Optional[List[str]] = None) -> Tupl
                     vlm_pages_count += 1
 
             file_report[file_path.name] = f"shx_pages({shx_pages_count})_vlm_pages({vlm_pages_count})"
+
+    # Tag every loaded document with the property name metadata
+    for doc in documents:
+        doc.metadata["property_name"] = property_name
 
     return documents, file_report
 
@@ -477,18 +496,15 @@ def build_or_reload_chain() -> None:
     rag_chain = create_retrieval_chain(retriever, answer_chain)
 
 
-def ingest_documents(target_files: Optional[List[str]] = None) -> Dict[str, int]:
-    """Processes, chunks, and writes documents into ChromaDB in batches before reloading the pipeline.
-
-    Args:
-        target_files (Optional[List[str]]): Optional list of specific file paths or names to ingest.
-
-    Returns:
-        Dict[str, int]: Summary dictionary containing total chunk and loaded document counts.
-    """
+def ingest_documents(
+    property_name: str = "default",
+    target_files: Optional[List[str]] = None
+) -> Dict[str, Any]:
+    """Processes, tags with property metadata, and appends chunks into ChromaDB."""
     global vector_store, retriever, rag_chain
 
-    raw_docs, _ = load_documents_from_folder(target_files=target_files)   
+    # 1. Load documents for the specific property
+    raw_docs, _ = load_documents_from_folder(property_name=property_name, target_files=target_files)   
     final_chunks: List[Document] = []
     text_splitter = RecursiveCharacterTextSplitter(
         chunk_size=1200,
@@ -496,36 +512,46 @@ def ingest_documents(target_files: Optional[List[str]] = None) -> Dict[str, int]
         separators=["\n\n", "\n", ". ", " ", ""],
     )
 
+    # 2. Split non-PDF documents while preserving property_name
     for doc in raw_docs:
         if doc.metadata.get("file_type") == "pdf":
             final_chunks.append(doc)
         else:
-            final_chunks.extend(text_splitter.split_documents([doc]))
+            split_docs = text_splitter.split_documents([doc])
+            final_chunks.extend(split_docs)
 
     valid_chunks = [d for d in final_chunks if d.page_content and d.page_content.strip()]
     if not valid_chunks:
-        return {"chunks_indexed": 0, "documents_loaded": len(raw_docs)}
+        return {"chunks_indexed": 0, "documents_loaded": len(raw_docs), "property": property_name}
     
+    # 3. Ensure property_name is attached to every single chunk
+    for chunk in valid_chunks:
+        chunk.metadata["property_name"] = property_name
+
     CHROMA_DIR.mkdir(parents=True, exist_ok=True)
+    
+    # 4. Initialize vector_store if needed, then append new documents (DO NOT use Chroma.from_documents)
+    if vector_store is None:
+        vector_store = Chroma(
+            collection_name=COLLECTION_NAME,
+            persist_directory=str(CHROMA_DIR),
+            embedding_function=embeddings_model,
+        )
+
+    # 5. Append in batches so existing vector data for other properties remains intact
     batch_size = 50 
-    
-    vector_store = Chroma.from_documents(
-        documents=valid_chunks[:batch_size],
-        embedding=embeddings_model,
-        collection_name=COLLECTION_NAME,
-        persist_directory=str(CHROMA_DIR),
-    )
-    
-    for i in range(batch_size, len(valid_chunks), batch_size):
+    for i in range(0, len(valid_chunks), batch_size):
         vector_store.add_documents(valid_chunks[i : i + batch_size])
     
-    retriever = _get_compressed_retriever(vector_store)
-    answer_chain = create_stuff_documents_chain(llm, prompt_template)
-    rag_chain = create_retrieval_chain(retriever, answer_chain)
+    # 6. Refresh active RAG chain
+    build_or_reload_chain()
 
-    return {"chunks_indexed": len(final_chunks), "documents_loaded": len(raw_docs)}
-
-
+    return {
+        "chunks_indexed": len(valid_chunks), 
+        "documents_loaded": len(raw_docs),
+        "property": property_name
+    }
+    
 def preview_chroma_chunks(
     limit: int = 5, 
     chars: int = 400, 
@@ -586,7 +612,8 @@ def _extract_source_info(doc: Document, index: int) -> Dict[str, Any]:
     }
 
 
-def ask_question(question: str) -> Dict[str, Any]:
+
+def ask_question(question: str, property_name: Optional[str] = None) -> Dict[str, Any]:
     """Executes a two-stage retrieval query with VertexAIRank compression and cited LLM generation.
 
     Args:
@@ -596,13 +623,33 @@ def ask_question(question: str) -> Dict[str, Any]:
         Dict[str, Any]: Payload containing the grounded LLM answer and associated citation source objects.
     """
     global vector_store
+
+    # 1. Ensure vector_store is initialized FIRST
     if vector_store is None:
         build_or_reload_chain()
 
-    raw_candidates = vector_store.similarity_search(question, k=FETCH_K)
+    # 2. Build ChromaDB filter
+    filter_dict = None
+    if property_name and property_name != "All":
+        filter_dict = {"property_name": property_name}
+
+    # 3. Retrieve raw candidates directly using the filter
+    raw_candidates = vector_store.similarity_search(
+        question, 
+        k=FETCH_K, 
+        filter=filter_dict
+    )
+
+    # 4. Guard against empty results before invoking Vertex AI Reranker
+    if not raw_candidates:
+        return {
+            "answer": f"No relevant documents found for property: '{property_name or 'All'}'.",
+            "sources": []
+        }
+
+    # 5. Rerank valid documents
     reranked_docs = reranker.compress_documents(documents=raw_candidates, query=question)
     content_to_meta = {doc.page_content: doc.metadata for doc in raw_candidates}
-
     print("\n=================== RERANKED RESULTS ===================")
     for rank, doc in enumerate(reranked_docs, start=1):
         meta = doc.metadata

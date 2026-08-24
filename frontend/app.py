@@ -6,20 +6,21 @@ from PIL import Image
 import google.auth.transport.requests
 import google.oauth2.id_token
 
-
 st.set_page_config(
     page_title="Document Intelligence RAG", page_icon="🏗️", layout="wide"
 )
+
 BACKEND_URL = os.getenv("BACKEND_URL", "http://localhost:8000").rstrip("/")
 
 API_BASE_URL = st.sidebar.text_input(
     "FastAPI Base URL", value=BACKEND_URL
 ).rstrip("/")
 
+
 def get_auth_headers(target_url: str) -> dict:
     """Generates an OIDC ID Token for Cloud Run service-to-service authentication."""
     if "localhost" in target_url or "127.0.0.1" in target_url:
-        return {}  # Skip token header during local Mac testing
+        return {}
     
     try:
         auth_req = google.auth.transport.requests.Request()
@@ -30,10 +31,13 @@ def get_auth_headers(target_url: str) -> dict:
         return {}
 
 
-
-# Health Check Indicator
+# 1. Health Check Indicator (Timeout increased to 15s for Cloud Run cold starts)
 try:
-    health_res = requests.get(f"{API_BASE_URL}/health", headers=get_auth_headers(API_BASE_URL), timeout=3)
+    health_res = requests.get(
+        f"{API_BASE_URL}/health", 
+        headers=get_auth_headers(API_BASE_URL), 
+        timeout=15
+    )
     if health_res.status_code == 200:
         st.sidebar.success("Backend Connected 🟢")
     else:
@@ -43,35 +47,56 @@ except Exception:
 
 st.sidebar.markdown("---")
 
-# 2. Chunk Preview Inspector
-st.sidebar.markdown("---")
-st.sidebar.subheader("🔍 Chunk Inspector")
-limit = st.sidebar.slider("Chunk Limit", min_value=1, max_value=20, value=5)
-chars = st.sidebar.slider(
-    "Chars Per Chunk", min_value=100, max_value=1000, value=400
+# 2. Dynamic Property Context Selector
+properties = []
+try:
+    prop_res = requests.get(
+        f"{API_BASE_URL}/properties", 
+        headers=get_auth_headers(API_BASE_URL),
+        timeout=5
+    )
+    if prop_res.status_code == 200:
+        properties = prop_res.json().get("properties", [])
+except Exception:
+    pass
+
+selected_property = st.sidebar.selectbox(
+    "🏢 Select Property Context",
+    options=["All"] + properties
 )
 
-if st.sidebar.button("Preview Chunks", use_container_width=True):
-    try:
-        res = requests.post(
-            f"{API_BASE_URL}/preview-chunks",
-            json={"limit": limit, "chars": chars},
-            headers=get_auth_headers(API_BASE_URL),
-            timeout=10,
-        )
-        if res.status_code == 200:
-            chunks = res.json().get("chunks", [])
-            st.session_state["preview_chunks"] = chunks
-        else:
-            st.sidebar.error(f"Error ({res.status_code}): {res.text}")
-    except Exception as e:
-        st.sidebar.error(f"Preview failed: {e}")
+st.sidebar.markdown("---")
 
-if "preview_chunks" in st.session_state:
-    with st.sidebar.expander("Inspected Chunk Heads", expanded=False):
-        for idx, chunk in enumerate(st.session_state["preview_chunks"], 1):
-            st.markdown(f"**Chunk {idx}:**")
-            st.code(chunk, language="text")
+# 3. Document Upload & Ingestion Section
+st.sidebar.subheader("📤 Upload & Ingest Documents")
+prop_input = st.sidebar.text_input("Property Name (e.g., Oak_Ridge_Site)")
+uploaded_files = st.sidebar.file_uploader(
+    "Upload PDFs", accept_multiple_files=True, type=["pdf"]
+)
+
+if st.sidebar.button("Ingest Files", use_container_width=True):
+    if prop_input and uploaded_files:
+        files_payload = [
+            ("files", (f.name, f.getvalue(), f.type)) for f in uploaded_files
+        ]
+        with st.sidebar.spinner("Uploading, parsing, & indexing..."):
+            try:
+                res = requests.post(
+                    f"{API_BASE_URL}/upload-and-ingest",
+                    data={"property_name": prop_input},
+                    files=files_payload,
+                    headers=get_auth_headers(API_BASE_URL),
+                    timeout=180,  # Extended timeout for PDF/VLM processing
+                )
+                if res.status_code == 200:
+                    st.sidebar.success("Ingestion complete!")
+                    st.rerun()
+                else:
+                    st.sidebar.error(f"Ingestion failed ({res.status_code}): {res.text}")
+            except Exception as e:
+                st.sidebar.error(f"Failed to connect: {e}")
+    else:
+        st.sidebar.warning("Please enter a property name and select at least one PDF.")
 
 
 # --- MODAL DIALOG FOR CITATION HIGHLIGHT PREVIEW ---
@@ -99,9 +124,6 @@ def view_citation_modal(source_item: dict):
             if response.status_code == 200:
                 image_bytes = response.content
                 image = Image.open(io.BytesIO(image_bytes))
-
-                # 1. Force PNG output to avoid lossy JPEG compression
-                # 2. Drop `use_container_width=True` or match native aspect ratio
                 st.image(image, output_format="PNG")
             else:
                 st.error(
@@ -113,8 +135,7 @@ def view_citation_modal(source_item: dict):
 # --- MAIN UI: Chat Interface ---
 st.title("🏗️ Document Intelligence Assistant")
 st.caption(
-    "Ask questions about your uploaded construction plans, specs, and"
-    " documents."
+    "Ask questions about your uploaded construction plans, specs, and documents."
 )
 
 if "messages" not in st.session_state:
@@ -157,7 +178,10 @@ if prompt := st.chat_input("Ask a question about your project docs..."):
 
         try:
             res = requests.post(
-                f"{API_BASE_URL}/ask", json={"question": prompt}, headers=get_auth_headers(API_BASE_URL), timeout=60
+                f"{API_BASE_URL}/ask",
+                json={"question": prompt, "property_name": selected_property},
+                headers=get_auth_headers(API_BASE_URL),
+                timeout=60,
             )
 
             if res.status_code == 200:
