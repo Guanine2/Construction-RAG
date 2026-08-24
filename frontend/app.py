@@ -31,7 +31,7 @@ def get_auth_headers(target_url: str) -> dict:
         return {}
 
 
-# 1. Health Check Indicator (Timeout increased to 15s for Cloud Run cold starts)
+# 1. Health Check Indicator
 try:
     health_res = requests.get(
         f"{API_BASE_URL}/health", 
@@ -47,7 +47,7 @@ except Exception:
 
 st.sidebar.markdown("---")
 
-# 2. Dynamic Property Context Selector
+# 2. Dynamic Property Context Selector (For Chat Querying)
 properties = []
 try:
     prop_res = requests.get(
@@ -69,13 +69,42 @@ st.sidebar.markdown("---")
 
 # 3. Document Upload & Ingestion Section
 st.sidebar.subheader("📤 Upload & Ingest Documents")
-prop_input = st.sidebar.text_input("Property Name (e.g., Oak_Ridge_Site)")
+
+# Choose between selecting an existing property dropdown or creating a new one
+if properties:
+    upload_mode = st.sidebar.radio(
+        "Upload Target",
+        options=["Existing Property", "➕ New Property"],
+        horizontal=True
+    )
+    
+    if upload_mode == "Existing Property":
+        target_property = st.sidebar.selectbox(
+            "Select Existing Property",
+            options=properties,
+            key="upload_existing_prop_select"
+        )
+    else:
+        target_property = st.sidebar.text_input(
+            "New Property Name", 
+            placeholder="e.g., Oak_Ridge_Site",
+            key="upload_new_prop_input"
+        )
+else:
+    target_property = st.sidebar.text_input(
+        "Property Name", 
+        placeholder="e.g., Oak_Ridge_Site",
+        key="upload_new_prop_input"
+    )
+
 uploaded_files = st.sidebar.file_uploader(
     "Upload PDFs", accept_multiple_files=True, type=["pdf"]
 )
 
 if st.sidebar.button("Ingest Files", use_container_width=True):
-    if prop_input and uploaded_files:
+    clean_target_property = target_property.strip().replace(" ", "_") if target_property else ""
+    
+    if clean_target_property and uploaded_files:
         files_payload = [
             ("files", (f.name, f.getvalue(), f.type)) for f in uploaded_files
         ]
@@ -83,20 +112,20 @@ if st.sidebar.button("Ingest Files", use_container_width=True):
             try:
                 res = requests.post(
                     f"{API_BASE_URL}/upload-and-ingest",
-                    data={"property_name": prop_input},
+                    data={"property_name": clean_target_property},
                     files=files_payload,
                     headers=get_auth_headers(API_BASE_URL),
-                    timeout=180,  # Extended timeout for PDF/VLM processing
+                    timeout=180,
                 )
                 if res.status_code == 200:
-                    st.sidebar.success("Ingestion complete!")
+                    st.sidebar.success(f"Ingested to '{clean_target_property}'!")
                     st.rerun()
                 else:
                     st.sidebar.error(f"Ingestion failed ({res.status_code}): {res.text}")
             except Exception as e:
                 st.sidebar.error(f"Failed to connect: {e}")
     else:
-        st.sidebar.warning("Please enter a property name and select at least one PDF.")
+        st.sidebar.warning("Please provide a valid property name and select at least one PDF.")
 
 
 # --- MODAL DIALOG FOR CITATION HIGHLIGHT PREVIEW ---

@@ -68,7 +68,7 @@ async def upload_and_ingest(
         saved_files.append(file_path)
 
     # Trigger ingestion passing property metadata
-    result = ingest_documents(property_name=clean_prop_name, file_paths=saved_files)
+    result = ingest_documents(property_name=clean_prop_name, target_files=saved_files)
     return {"status": "success", "property": clean_prop_name, **result}
 
 # --- Helper Function: BBox Parser & Normalizer ---
