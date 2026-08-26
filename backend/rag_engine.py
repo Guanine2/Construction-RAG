@@ -594,6 +594,7 @@ def _extract_source_info(doc: Document, index: int) -> Dict[str, Any]:
         "page_number": meta.get("page_number", 1),
         "page_numbers": str(meta.get("page_numbers", "N/A")),
         "dl_prov": dl_prov,
+        "property_name": meta.get("property_name"),  # Expose property_name to frontend
     }
 
 

@@ -4,9 +4,10 @@ from pydantic import BaseModel, Field
 import uvicorn
 from fastapi.responses import Response
 import pymupdf as fitz
-from PIL import Image, ImageDraw
+from PIL import Image
 import json
 import os
+from pathlib import Path
 
 from backend.rag_engine import (
     DOCS_DIR,
@@ -45,7 +46,7 @@ class HighlightRequest(BaseModel):
     source: str
     page_number: int
     dl_prov: list
-
+    property_name: Optional[str] = None 
 
 class IngestRequest(BaseModel):
     """Optional ingestion request wrapper for client-uploaded files."""
@@ -146,9 +147,24 @@ def parse_and_normalize_bboxes(
 def render_highlight_endpoint(payload: HighlightRequest):
     """Render a page image with the relevant source citation boxes highlighted."""
     try:
-        pdf_path = DOCS_DIR / payload.source
+        pdf_path = None
+
+        if payload.property_name:
+            pdf_path = DOCS_DIR / payload.property_name / payload.source
+
+        if not pdf_path or not pdf_path.exists():
+            pdf_path = DOCS_DIR / payload.source
+
         if not pdf_path.exists():
-            raise HTTPException(status_code=404, detail="PDF file not found")
+            target_name = Path(payload.source).name
+            matching_files = list(DOCS_DIR.rglob(target_name))
+            if matching_files:
+                pdf_path = matching_files[0]
+            else:
+                raise HTTPException(
+                    status_code=404,
+                    detail=f"PDF file '{payload.source}' not found under {DOCS_DIR}",
+                )
 
         with fitz.open(str(pdf_path)) as doc:
             if payload.page_number < 1 or payload.page_number > len(doc):
@@ -185,7 +201,6 @@ def render_highlight_endpoint(payload: HighlightRequest):
         raise
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Highlight rendering error: {str(exc)}")
-
 
 @app.on_event("startup")
 def startup_event() -> None:
