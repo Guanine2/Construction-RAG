@@ -113,7 +113,7 @@ if st.sidebar.button("Ingest Files", use_container_width=True):
                     data={"property_name": clean_target_property},
                     files=files_payload,
                     headers=get_auth_headers(API_BASE_URL),
-                    timeout=180,
+                    timeout=3600,
                 )
                 if res.status_code == 200:
                     st.sidebar.success(f"Ingested to '{clean_target_property}'!")
@@ -206,7 +206,7 @@ if prompt := st.chat_input("Ask a question about your project docs..."):
                 f"{API_BASE_URL}/ask",
                 json={"question": prompt, "property_name": selected_property},
                 headers=get_auth_headers(API_BASE_URL),
-                timeout=60,
+                timeout=180,
             )
 
             if res.status_code == 200:
