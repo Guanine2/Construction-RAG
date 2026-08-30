@@ -438,17 +438,36 @@ def load_documents_from_folder(
     target_files: Optional[List[str]] = None,
 ) -> Tuple[List[Document], Dict[str, str]]:
     """Load every document in a property folder and return the records plus a file report."""
-    prop_dir = DOCS_DIR / property_name
+    
+    # 1. Sanitize property_name to prevent directory traversal
+    clean_prop_name = Path(property_name).name
+    prop_dir = (DOCS_DIR / clean_prop_name).resolve()
+    
+    # Ensure prop_dir stays within DOCS_DIR
+    if not prop_dir.is_relative_to(DOCS_DIR.resolve()):
+        raise ValueError(f"Invalid property path: {property_name}")
+
     prop_dir.mkdir(parents=True, exist_ok=True)
 
     documents: List[Document] = []
     file_report: Dict[str, str] = {}
 
-    candidate_paths = (
-        [prop_dir / f if not Path(f).is_absolute() else Path(f) for f in target_files]
-        if target_files else sorted(prop_dir.iterdir())
-    )
+    # 2. Build candidate paths safely
+    candidate_paths = []
+    if target_files:
+        for f in target_files:
+            # Strip directory components to enforce local filename handling
+            safe_filename = Path(f).name
+            resolved_path = (prop_dir / safe_filename).resolve()
 
+            # Ensure file is inside DOCS_DIR before accessing
+            if resolved_path.is_relative_to(DOCS_DIR.resolve()):
+                candidate_paths.append(resolved_path)
+            else:
+                logger.warning(f"Blocked unauthorized file access attempt: {f}")
+    else:
+        candidate_paths = sorted(prop_dir.iterdir())
+        
     for file_path in candidate_paths:
         if not file_path.exists() or file_path.is_dir():
             continue
