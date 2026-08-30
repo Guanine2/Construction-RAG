@@ -247,7 +247,10 @@ def preview_chunks_endpoint(request: PreviewRequest) -> dict:
 def ask_endpoint(request: QueryRequest) -> dict:
     """Submit a user question to the RAG system and return the grounded answer."""
     try:
-        return ask_question(request.question)
+        return ask_question(
+            question=request.question,
+            property_name=request.property_name,  
+            )
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc))
 
